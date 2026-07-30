@@ -903,8 +903,31 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             VectorXd rhs_scaled(n_dof);
             for(int i=0;i<n_dof;i++) rhs_scaled(i) = -RR(i)*Sscale(i);
 
+            // Iterative first, direct as fallback.
+            //
+            // Once the system is equilibrated the ILU-preconditioned iterative
+            // solve is reliable AND far cheaper: a direct factorization of the
+            // ~20k dof system costs ~1.4 min per Newton iteration here, which
+            // dominated the runtime. The reason the iterative path was demoted
+            // originally - BiCGSTAB returning a garbage increment while
+            // reporting success - is now caught three ways: equilibration fixes
+            // the conditioning that caused it, the increment is checked for
+            // finiteness below, and a step that fails to converge is rejected
+            // rather than accepted.
             bool solved = false;
             {
+                BICGsolver.compute(KK2);
+                if(BICGsolver.info()==Eigen::Success){
+                    VectorXd y = BICGsolver.solve(rhs_scaled);
+                    if(BICGsolver.info()==Eigen::Success){
+                        for(int i=0;i<n_dof;i++) SOL(i) = y(i)*Sscale(i);
+                        solved = true;
+                    }
+                }
+            }
+            if(!solved){
+                // Iterative solve stagnated: fall back to a direct
+                // factorization for this iteration.
                 SparseMatrix<double, ColMajor> KKcol = KK2;
                 KKcol.makeCompressed();
                 SparseLUsolver.analyzePattern(KKcol);
@@ -912,18 +935,6 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 if(SparseLUsolver.info()==Eigen::Success){
                     VectorXd y = SparseLUsolver.solve(rhs_scaled);
                     if(SparseLUsolver.info()==Eigen::Success){
-                        for(int i=0;i<n_dof;i++) SOL(i) = y(i)*Sscale(i);
-                        solved = true;
-                    }
-                }
-            }
-            if(!solved){
-                // Direct factorization failed (genuinely singular tangent).
-                // Try the equilibrated iterative solver before giving up.
-                BICGsolver.compute(KK2);
-                if(BICGsolver.info()==Eigen::Success){
-                    VectorXd y = BICGsolver.solve(rhs_scaled);
-                    if(BICGsolver.info()==Eigen::Success){
                         for(int i=0;i<n_dof;i++) SOL(i) = y(i)*Sscale(i);
                         solved = true;
                     }
@@ -1095,7 +1106,9 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 if(r  < worst){ worst = r;  which = "rho"; }
                 if(cc < worst){ worst = cc; which = "c"; }
                 if(aa < worst){ worst = aa; which = "alpha"; }
-                if(r < 0.0 || cc < 0.0 || aa < 0.0) n_neg++;
+                // Threshold, not < 0: alpha_h is exactly 0, so round-off makes
+                // half the mesh look "negative" and hides the real magnitude.
+                if(r < -1e-8 || cc < -1e-8 || aa < -1e-8) n_neg++;
             }
             if(n_neg > 0)
                 std::cout<<"  NEGATIVE SPECIES at step "<<step<<": "<<n_neg

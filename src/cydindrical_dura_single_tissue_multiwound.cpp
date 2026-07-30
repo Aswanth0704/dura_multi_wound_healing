@@ -31,8 +31,9 @@
     WOUND_ALPHA_D     D_alpha   [mm^2/h]  (0 decouples alpha spatially)
     WOUND_ALPHA_DECAY d_alpha   [1/h]
     WOUND_ALPHA_PC    p_c_alpha [1/h]     (0 decouples alpha from cytokine)
-    WOUND_TRAMP     duration of the small-dt puncture transient [h] (0 disables)
-    WOUND_DTRAMP    time step during that transient [h]
+    WOUND_DTRAMP    first (smallest) time step of the transient ladder [h]
+    WOUND_RUNGS     steps per rung of that ladder (0 disables the ladder)
+    WOUND_WSMOOTH   width of the smooth wound edge [mm]
 */
 
 #include <omp.h>
@@ -746,22 +747,42 @@ int main(int argc, char *argv[])
     // Seed the wound into the already-deformed tissue. Membership is tested on
     // the DEFORMED coordinates node_x, because the puncture is made in the
     // prestretched in-vivo configuration, not in the unloaded reference.
+    // Seed the wound with a SMOOTH radial severity profile rather than a perfect
+    // step. Seeding a discontinuity across one element makes the converged
+    // Galerkin solution undershoot at the interface: with a sharp step the
+    // solver converged to residual 2e-10 yet produced alpha as low as -0.072 and
+    // c as low as -0.052, i.e. ~5-7% of each field's range. That is the classic
+    // oscillation at a discontinuous initial condition, not a solver defect, and
+    // the fix belongs in the initial condition. A damage gradient is also the
+    // more faithful description of a needle track than a step.
+    //
+    //   sev(r) = 1/2 (1 - tanh((r - r_wound)/w))
+    //
+    // so sev ~ 1 on the axis, 1/2 at r_wound, ~0 beyond, over a transition of
+    // roughly two elements.
+    const double w_smooth = env_dbl("WOUND_WSMOOTH", 0.06);   // [mm]
+    auto severity = [&](const Vector3d& x){
+        if(x(0) < Xmin_wound || x(0) > Xmax_wound) return 0.0;
+        const double r = std::sqrt((x(1)-y_center)*(x(1)-y_center)
+                                 + (x(2)-z_center)*(x(2)-z_center));
+        return 0.5*(1.0 - std::tanh((r - r_wound)/w_smooth));
+    };
+    auto blend = [](double healthy, double wound, double sev){
+        return healthy + sev*(wound - healthy);
+    };
+
     int n_wound_nodes = 0, n_wound_ip = 0;
     for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
-        const Vector3d& x = myTissue.node_x[nodei];
-        const double r2 = (x(1)-y_center)*(x(1)-y_center)
-                        + (x(2)-z_center)*(x(2)-z_center);
-        const bool inside = (x(0) >= Xmin_wound && x(0) <= Xmax_wound)
-                         && (r2 <= (r_wound+tol_boundary)*(r_wound+tol_boundary));
-        if(inside){
-            if(verbose) std::cout << "wound node " << nodei << "\n";
-            myTissue.node_rho_0[nodei] = rho_wound;
-            myTissue.node_rho[nodei]   = rho_wound;
-            myTissue.node_c_0[nodei]   = c_wound;
-            myTissue.node_c[nodei]     = c_wound;
-            myTissue.node_alpha_0[nodei] = alpha_wound;
-            myTissue.node_alpha[nodei]   = alpha_wound;
-            n_wound_nodes++;
+        const double sev = severity(myTissue.node_x[nodei]);
+        if(sev > 1e-3){
+            if(verbose) std::cout << "wound node " << nodei << " sev " << sev << "\n";
+            const double r = blend(rho_healthy,   rho_wound,   sev);
+            const double c = blend(c_healthy,     c_wound,     sev);
+            const double a = blend(alpha_healthy, alpha_wound, sev);
+            myTissue.node_rho_0[nodei]   = r;  myTissue.node_rho[nodei]   = r;
+            myTissue.node_c_0[nodei]     = c;  myTissue.node_c[nodei]     = c;
+            myTissue.node_alpha_0[nodei] = a;  myTissue.node_alpha[nodei] = a;
+            if(sev > 0.5) n_wound_nodes++;
         }
     }
     for(int elemi=0;elemi<myMesh.n_elements;elemi++){
@@ -776,21 +797,20 @@ int main(int argc, char *argv[])
             Vector3d x_IP = Vector3d::Zero();
             for(int nodej=0;nodej<elem_size;nodej++)
                 x_IP += R[nodej]*myTissue.node_x[myMesh.elements[elemi][nodej]];
-            const double r2 = (x_IP(1)-y_center)*(x_IP(1)-y_center)
-                            + (x_IP(2)-z_center)*(x_IP(2)-z_center);
-            const bool inside = (x_IP(0) >= Xmin_wound && x_IP(0) <= Xmax_wound)
-                             && (r2 <= (r_wound+tol_boundary)*(r_wound+tol_boundary));
-            if(inside){
+            const double sev = severity(x_IP);
+            if(sev > 1e-3){
                 const int g = elemi*IP_size+ip;
-                if(verbose) std::cout<<"IP node: "<<g<<"\n";
+                if(verbose) std::cout<<"IP node: "<<g<<" sev "<<sev<<"\n";
                 Vector3d a0,s0,n0;
                 build_cylinder_frame(x_IP, a0_healthy, 0.0, 0.0, a0, s0, n0);
-                myTissue.ip_phif_0[g] = phif0_wound;  myTissue.ip_phif[g] = phif0_wound;
-                myTissue.ip_a0_0[g]   = a0;           myTissue.ip_a0[g]   = a0;
-                myTissue.ip_s0_0[g]   = s0;           myTissue.ip_s0[g]   = s0;
-                myTissue.ip_n0_0[g]   = n0;           myTissue.ip_n0[g]   = n0;
-                myTissue.ip_kappa_0[g]= kappa0_wound; myTissue.ip_kappa[g]= kappa0_wound;
-                n_wound_ip++;
+                const double ph = blend(phif0_healthy,  phif0_wound,  sev);
+                const double kp = blend(kappa0_healthy, kappa0_wound, sev);
+                myTissue.ip_phif_0[g] = ph;  myTissue.ip_phif[g] = ph;
+                myTissue.ip_a0_0[g]   = a0;  myTissue.ip_a0[g]   = a0;
+                myTissue.ip_s0_0[g]   = s0;  myTissue.ip_s0[g]   = s0;
+                myTissue.ip_n0_0[g]   = n0;  myTissue.ip_n0[g]   = n0;
+                myTissue.ip_kappa_0[g]= kp;  myTissue.ip_kappa[g]= kp;
+                if(sev > 0.5) n_wound_ip++;
             }
         }
     }
@@ -825,24 +845,38 @@ int main(int argc, char *argv[])
     // larger, so the transport diagonal dominates and the transient is
     // resolved rather than fought. The cost is a few hundred cheap steps.
     //-------------------------------------------------------------------//
+    // A GEOMETRIC dt LADDER, not a long run at one small step. The transient is
+    // a one-off mechanical equilibration, so once it is absorbed the step can
+    // grow straight back. 200 steps at a fixed dt = 0.002 h was ~4.75 h of wall
+    // clock for 0.4 h of simulated time; the ladder below covers the same
+    // transient in ~40 cheap steps.
     const double dt_normal = myTissue.time_step;
-    const double t_ramp    = env_dbl("WOUND_TRAMP",  0.4);
-    const double dt_ramp   = env_dbl("WOUND_DTRAMP", 0.002);
-    if(t_ramp > 0.0 && dt_ramp > 0.0 && dt_ramp < dt_normal){
-        myTissue.time = 0.0;
-        myTissue.time_final = t_ramp;
-        myTissue.time_step  = dt_ramp;
-        int sf = (int)std::max(1.0, (t_ramp/dt_ramp)/4.0);
-        std::string fr = out_prefix + "_ramp_";
-        std::cout<<"\n#### PHASE 2a: puncture transient, "<<t_ramp
-                 <<" h at dt = "<<dt_ramp<<" ####\n";
-        sparseWoundSolver(myTissue, fr, sf, save_node, save_ip);
-        reportState(myTissue, IP, "after the puncture transient");
+    const int    n_rung    = (int)env_dbl("WOUND_RUNGS",   10);  // steps per rung
+    const double dt_start  = env_dbl("WOUND_DTRAMP", 0.002);
+    double t_ramp_total = 0.0;
+    if(dt_start > 0.0 && dt_start < dt_normal && n_rung > 0){
+        std::cout<<"\n#### PHASE 2a: puncture transient, geometric dt ladder ####\n";
+        int rung = 0;
+        for(double dt = dt_start; dt < dt_normal; dt *= 5.0, ++rung){
+            const double dt_use = std::min(dt, dt_normal);
+            myTissue.time = 0.0;
+            myTissue.time_step  = dt_use;
+            myTissue.time_final = n_rung*dt_use;
+            std::ostringstream fr;
+            fr << out_prefix << "_ramp" << rung << "_";
+            std::cout<<"  rung "<<rung<<": "<<n_rung<<" steps at dt = "<<dt_use
+                     <<"  ("<<n_rung*dt_use<<" h)\n";
+            sparseWoundSolver(myTissue, fr.str(), std::max(1, n_rung/2),
+                              save_node, save_ip);
+            t_ramp_total += n_rung*dt_use;
+        }
         myTissue.time_step = dt_normal;
+        reportState(myTissue, IP, "after the puncture transient");
+        std::cout<<"  transient absorbed over "<<t_ramp_total<<" h\n";
     }
 
     myTissue.time = 0.0;
-    myTissue.time_final = std::max(0.0, t_heal - t_ramp);
+    myTissue.time_final = std::max(0.0, t_heal - t_ramp_total);
     std::string f = out_prefix + "_heal_";
     std::cout<<"\n#### PHASE 2b: healing for "<<myTissue.time_final
              <<" h at dt = "<<dt_normal<<" ####\n";
