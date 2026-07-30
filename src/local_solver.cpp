@@ -12,6 +12,7 @@ This code is the implementation of the DaLaWoHe
 #include <iomanip>
 #include "wound.h"
 #include "local_solver.h"
+#include "mechanosensing.h"
 #include "element_functions.h"
 #include <iostream>
 #include <cmath>
@@ -199,7 +200,12 @@ void localWoundProblemExplicit(
         //std::cout << "\n vectormax" << vectormax << "\n lamdaMax" << lamdamax << "\n";
 
         // Mechanosensing
-        double He = 1./(1.+exp(-gamma_theta*(Je - vartheta_e)));
+        // Mechanosensing stimulus: in-plane AREAL elastic stretch of the dural
+        // mid-surface, theta_e = ||cof(F^e).n0||, NOT det(F^e). The tissue is
+        // treated as incompressible so det(F^e)==1 and could never respond to
+        // membrane stretch. See include/mechanosensing.h.
+        double theta_e = evalThetaE(J, CCinv, n0, lamdaP(0), lamdaP(1));
+        double He = evalHe(theta_e, vartheta_e, gamma_theta);
         //if(He<0.002){He=0;}
 
         //----------------------------//
@@ -372,7 +378,8 @@ void localWoundProblemExplicit(
         // Calculate derivative of He wrt to CC. If this is the same H, this is the same as in the main code.
         Matrix3d dHedCC_explicit, dphifdotplusdCC; dHedCC_explicit.setZero(); dphifdotplusdCC.setZero();
         phif_dot_plus = (p_phi + (p_phi_c*c)/(K_phi_c+c) + p_phi_theta*He)*(rho/(K_phi_rho+phif));
-        dHedCC_explicit = (-1./pow((1.+exp(-gamma_theta*(Je - vartheta_e))),2))*(exp(-gamma_theta*(Je - vartheta_e)))*(-gamma_theta)*(J*CCinv/(2*Jp));
+        // dH/dCC = gamma_e H (1-H) dtheta_e/dCC  (was dJe/dCC = J CCinv/(2 Jp))
+        dHedCC_explicit = evalDHedCC(theta_e, He, gamma_theta, CCinv, n0);
         dphifdotplusdCC = p_phi_theta*dHedCC_explicit*(rho/(K_phi_rho+phif));
         //std::cout<<"RHO " << rho << " p_phi_theta " << p_phi_theta << " dHedCC_explicit " << dHedCC_explicit << " CCinv " << CCinv;
 

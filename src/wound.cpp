@@ -11,6 +11,7 @@ This code is the implementation of the DaLaWoHe
 #include "wound.h"
 #include "local_solver.h"
 #include "element_functions.h"
+#include "mechanosensing.h"
 #include <iostream>
 #include <cmath>
 #include <map>
@@ -597,7 +598,12 @@ void evalWound(
         //------------------//
         // SOURCE
         //------------------//
-        double He = 1./(1.+exp(-gamma_theta*(Je - vartheta_e)));
+        // Mechanosensing stimulus: in-plane AREAL elastic stretch of the dural
+        // mid-surface, theta_e = ||cof(F^e).n0||, NOT det(F^e). The tissue is
+        // treated as incompressible so det(F^e)==1 and could never respond to
+        // membrane stretch. See include/mechanosensing.h.
+        double theta_e = evalThetaE(J, CCinv, n0, lamdaP_a, lamdaP_s);
+        double He = evalHe(theta_e, vartheta_e, gamma_theta);
 
         // function for elastic response of the cells
         double S_rho = (p_rho + p_rho_c*c/(K_rho_c+c) + p_rho_theta*He)*(1-rho/K_rho_rho)*rho - d_rho*rho;
@@ -1020,7 +1026,8 @@ void evalWound(
         // SOURCE TERMS
         Matrix3d dHedCC_explicit; dHedCC_explicit.setZero();
         //
-        dHedCC_explicit = -1./pow((1.+exp(-gamma_theta*(Je - vartheta_e))),2)*(exp(-gamma_theta*(Je - vartheta_e)))*(-gamma_theta)*(J*CCinv/(2*Jp));
+        // dH/dCC = gamma_e H (1-H) dtheta_e/dCC  (was dJe/dCC = J CCinv/(2 Jp))
+        dHedCC_explicit = evalDHedCC(theta_e, He, gamma_theta, CCinv, n0);
         Matrix3d dS_rhodCC_explicit = (1-rho/K_rho_rho)*rho*p_rho_theta*dHedCC_explicit;
         VectorXd dS_rhodCC_voigt(6);
         Matrix3d dS_cdCC_explicit = (rho / (K_c_c + c)) * (p_c_thetaE * dHedCC_explicit);
@@ -1348,7 +1355,12 @@ void evalFluxesSources(const std::vector<double> &global_parameters, const doubl
     //------------------//
     // SOURCE
     //------------------//
-    double He = 1./(1.+exp(-gamma_theta*(Je - vartheta_e)));
+    // Mechanosensing stimulus: in-plane AREAL elastic stretch of the dural
+    // mid-surface, theta_e = ||cof(F^e).n0||, NOT det(F^e). The tissue is
+    // treated as incompressible so det(F^e)==1 and could never respond to
+    // membrane stretch. See include/mechanosensing.h.
+    double theta_e = evalThetaE(J, CCinv, n0, lamdaP(0), lamdaP(1));
+    double He = evalHe(theta_e, vartheta_e, gamma_theta);
 
     // function for elastic response of the cells
     S_rho = (p_rho + p_rho_c*c/(K_rho_c+c)+p_rho_theta*He)*(1-rho/K_rho_rho)*rho - d_rho*rho;
@@ -1639,8 +1651,14 @@ void evalS(const std::vector<double> &global_parameters, const double& phif,Vect
     Matrix3d FFginv = (1./lamdaP_a)*(a0a0) + (1./lamdaP_s)*(s0s0) + (1./lamdaP_n)*n0n0;
     Matrix3d CCe = FFginv*CC*FFginv;
     double Je = sqrt(CCe.determinant());
+    double J = Je*Jp;
     // Flux and Source terms for the rho and the C
-    double He = 1./(1.+exp(-gamma_theta*(Je - vartheta_e)));
+    // Mechanosensing stimulus: in-plane AREAL elastic stretch of the dural
+    // mid-surface, theta_e = ||cof(F^e).n0||, NOT det(F^e). The tissue is
+    // treated as incompressible so det(F^e)==1 and could never respond to
+    // membrane stretch. See include/mechanosensing.h.
+    double theta_e = evalThetaE(J, CCinv, n0, lamdaP_a, lamdaP_s);
+    double He = evalHe(theta_e, vartheta_e, gamma_theta);
     // function for elastic response of the cells
     S_rho = (p_rho + p_rho_c*c/(K_rho_c+c)+p_rho_theta*He)*(1-rho/K_rho_rho)*rho - d_rho*rho;
     // function for elastic response of the chemical

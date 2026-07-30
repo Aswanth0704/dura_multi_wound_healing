@@ -119,3 +119,14 @@ if(_extra_libs)
     target_link_libraries(woundcpp3D PRIVATE ${_extra_libs})
 endif()
 target_compile_features(woundcpp3D PRIVATE cxx_std_17)
+
+#---------------------------------------------------------------------------#
+# Tests.  Header-only checks, no solver linkage needed.
+#   make test_mechanosensing && ./test_mechanosensing
+#   or:  ctest
+#---------------------------------------------------------------------------#
+enable_testing()
+add_executable(test_mechanosensing EXCLUDE_FROM_ALL tests/test_mechanosensing.cpp)
+target_compile_features(test_mechanosensing PRIVATE cxx_std_17)
+add_test(NAME mechanosensing COMMAND test_mechanosensing)
+add_custom_target(tests DEPENDS test_mechanosensing)
