@@ -914,14 +914,39 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             // the conditioning that caused it, the increment is checked for
             // finiteness below, and a step that fails to converge is rejected
             // rather than accepted.
+            // info() == Success is NOT sufficient. BiCGSTAB can converge to
+            // y ~ 0 and report success when the ILU preconditioner breaks down:
+            // observed returning an increment of 6e-10 against a residual of
+            // 1e-3, so Newton had nothing to move with. It burned 200 iterations
+            // per step, every step was rejected, dt collapsed, and the run
+            // aborted with "Solver failed too many times". None of the three
+            // guards caught it - equilibration does not fix a broken
+            // preconditioner, 6e-10 is finite, and rejecting the step just
+            // repeated the same solve on a smaller dt.
+            //
+            // So verify the increment actually solves the system. One sparse
+            // matvec per iteration, against a direct factorization that costs
+            // ~1.4 min when it fires.
+            const double lin_tol = 1e-6;
+            auto lin_rel_resid = [&](const VectorXd &y){
+                const double bn = rhs_scaled.norm();
+                const double rn = (KK2*y - rhs_scaled).norm();
+                return (bn > 1e-300) ? rn/bn : rn;
+            };
+
             bool solved = false;
             {
                 BICGsolver.compute(KK2);
                 if(BICGsolver.info()==Eigen::Success){
                     VectorXd y = BICGsolver.solve(rhs_scaled);
-                    if(BICGsolver.info()==Eigen::Success){
+                    const double rel = lin_rel_resid(y);
+                    if(BICGsolver.info()==Eigen::Success && rel < lin_tol){
                         for(int i=0;i<n_dof;i++) SOL(i) = y(i)*Sscale(i);
                         solved = true;
+                    }else{
+                        std::cout<<"  iterative solve rejected (relative residual "
+                                 <<rel<<", info "<<(BICGsolver.info()==Eigen::Success?"ok":"fail")
+                                 <<") - falling back to a direct factorization\n";
                     }
                 }
             }
@@ -934,9 +959,13 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 SparseLUsolver.factorize(KKcol);
                 if(SparseLUsolver.info()==Eigen::Success){
                     VectorXd y = SparseLUsolver.solve(rhs_scaled);
-                    if(SparseLUsolver.info()==Eigen::Success){
+                    const double rel = lin_rel_resid(y);
+                    if(SparseLUsolver.info()==Eigen::Success && rel < 1e-4){
                         for(int i=0;i<n_dof;i++) SOL(i) = y(i)*Sscale(i);
                         solved = true;
+                    }else{
+                        std::cout<<"  direct solve also failed (relative residual "
+                                 <<rel<<")\n";
                     }
                 }
             }
