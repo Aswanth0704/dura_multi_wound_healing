@@ -126,6 +126,22 @@ inside an `omp critical`, so scaling saturates (observed 350–530% of 1200%).
 
 ## Open items
 
+- **α retains a small (~1.7%) transient undershoot at the wound front**, while
+  ρ, c and φ are now strictly positive. The reason is specific: ρ/c/φ have
+  healthy value 1, so a ~2% Galerkin oscillation at the front stays positive,
+  whereas **α_h is exactly 0** and has no headroom beneath it. Confirmed by the
+  `D_alpha = 0` run, where α's undershoot is 3e-17 — i.e. it is the diffusion
+  operator on the front, nothing else.
+  `plan.md` line 303 hedges toward α_h = 1e-4 "in case the solver throws
+  errors"; that instinct was right, though for a different reason. It is **not**
+  adopted here because α_h = 0 is what makes the fixed point exact — α_h = 1e-4
+  would inject `p_c_alpha·α_h` = 2.1e-5 against `d_c·c_h` = 3.9e-3, a permanent
+  0.54% perturbation to the cytokine balance. A transient artifact that damps is
+  preferable to a standing bias.
+  If it ever needs removing: give α alone a wider initial profile (~2.5 element
+  edges rather than 1.7). That is physically defensible, since the inflammatory
+  signal begins diffusing from the injury immediately and its initial footprint
+  is broader than the mechanical damage.
 - **`k_cut = 300` makes `C_low` a near-step** (0.0025 → 0.5 → 0.9975 across
   φ = 0 → 0.01 → 0.02, slope ~150 at φ = 0.01). It works, but if convergence
   degrades on finer meshes this is the first thing to soften.
