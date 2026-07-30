@@ -468,7 +468,7 @@ void evalWound(
         double dkappadc  = dThetadc(4);
         double dlamdaP_adc  = dThetadc(5);
         double dlamdaP_sdc  = dThetadc(6);
-        double dlamdaP_ndc  = dThetadrho(7);
+        double dlamdaP_ndc  = dThetadc(7);   // was dThetadrho(7): copy-paste slip
         //---------------------------------//
         //std::cout<<"SOLVE.\ndThetadCC\n"<<dThetadCC<<"\ndThetadrho\n"<<dThetadrho<<"\ndThetadc\n"<<dThetadc<<"\n";
 
@@ -885,7 +885,7 @@ void evalWound(
 
                 // structural
                 DDstruct(II,JJ) = dSSdphif(ii,jj)*dphifdCC(kk,ll) + dSSda0x(ii,jj)*da0xdCC(kk,ll)+ dSSda0y(ii,jj)*da0ydCC(kk,ll) + dSSda0z(ii,jj)*da0zdCC(kk,ll)
-                                  +dSSdkappa(ii,jj)*dkappadCC(kk,ll)+dSSdlamdaPa(ii,jj)*dlamdaP_adCC(kk,ll) +dSSdlamdaPs(ii,jj)*dlamdaP_ndCC(kk,ll)+dSSdlamdaPs(ii,jj)*dlamdaP_ndCC(kk,ll);
+                                  +dSSdkappa(ii,jj)*dkappadCC(kk,ll)+dSSdlamdaPa(ii,jj)*dlamdaP_adCC(kk,ll) +dSSdlamdaPs(ii,jj)*dlamdaP_sdCC(kk,ll)+dSSdlamdaPn(ii,jj)*dlamdaP_ndCC(kk,ll);
 
 
                 //--------------------------------------------------//
