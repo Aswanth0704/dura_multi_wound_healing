@@ -120,13 +120,16 @@ def main():
 
     pts, _ = read_vtk(files[0][1])
     wound, far = masks(pts)
+    # Wound nodes are identified ONCE, from the first snapshot, so the same set
+    # is tracked as the tissue deforms.
     print(f"{len(pts)} nodes: {len(wound)} in the wound, {len(far)} far field\n")
     if not wound:
         print("FAIL: wound region is empty - check the geometry constants")
         return 1
 
     print(f"{'t [h]':>8} {'rho_w':>9} {'c_w':>9} {'phi_w':>9} {'alpha_w':>9} "
-          f"{'rho_far':>9} {'c_far':>9} {'phi_far':>9} {'a_far':>8} {'min':>10}")
+          f"{'rho_far':>9} {'c_far':>9} {'phi_far':>9} {'a_far':>8} {'min':>10} "
+          f"{'r_rms':>9}")
     series = []
     for step, p in files:
         _, f = read_vtk(p)
@@ -143,9 +146,18 @@ def main():
         pf = stat(f["phi"], far)[1]
         af = stat(alpha, far)[1]
         gmin = min(min(f["rho"]), min(f["c"]), min(f["phi"]), min(alpha))
-        series.append((t, rw, cw, pw, aw, rf, cf, pf, af, gmin))
+        # Contraction metric: RMS distance of the tracked wound nodes from the
+        # needle-track axis, in the plane normal to it. A falling value means the
+        # puncture is closing.
+        cur_pts, _ = read_vtk(p)
+        rr = 0.0
+        for i in wound:
+            _, yy, zz = cur_pts[i]
+            rr += (yy - Y_CENTER) ** 2 + (zz - Z_CENTER) ** 2
+        rms = math.sqrt(rr / len(wound)) if wound else float("nan")
+        series.append((t, rw, cw, pw, aw, rf, cf, pf, af, gmin, rms))
         print(f"{t:8.1f} {rw:9.5f} {cw:9.5f} {pw:9.5f} {aw:9.5f} "
-              f"{rf:9.5f} {cf:9.5f} {pf:9.5f} {af:8.2e} {gmin:10.2e}")
+              f"{rf:9.5f} {cf:9.5f} {pf:9.5f} {af:8.2e} {gmin:10.2e} {rms:9.5f}")
 
     if len(series) < 2:
         print("\nnot enough snapshots yet for the trend checks")
@@ -201,6 +213,13 @@ def main():
     t_worst = min(series, key=lambda r: r[9])[0]
     ok("no significant negative concentration", worst >= -1e-6,
        f"global min={worst:.3e} at t={t_worst:.1f} h")
+
+    # 7. contraction of the needle track
+    r0, r1 = first[10], last[10]
+    if r0 == r0 and r1 == r1:  # not NaN
+        print(f"  {'ok  ' if r1 <= r0 else 'note'}  wound cross-section "
+              f"{'contracts' if r1 <= r0 else 'widens'}: r_rms "
+              f"{r0:.5f} -> {r1:.5f} mm ({100*(r1-r0)/r0:+.2f}%)")
 
     print(f"\n{'VERIFICATION PASSED' if not fails else f'{fails} CHECK(S) FAILED'}")
     return 1 if fails else 0
