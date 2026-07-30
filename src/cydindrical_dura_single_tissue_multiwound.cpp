@@ -391,7 +391,11 @@ int main(int argc, char *argv[])
     double tau_lamdaP_n = 0.05;
 
     double tol_local = 1e-8;        // inert in the explicit local solver
-    double time_step_ratio = 100;   // local substeps per global step
+    // Local substeps per global step. The binding local timescale is
+    // tau_lamdaP = 0.05 h, so local_dt must stay well under it; at 100 substeps
+    // local_dt = 0.002 h is 25x finer than needed, and this is the dominant
+    // runtime cost (100 x 79k IPs x ~6 Newton iterations per step).
+    double time_step_ratio = env_dbl("WOUND_LOCALSUB", 25);
     double max_iter = 100;          // inert in the explicit local solver
 
     // Deadband for plastic growth: no remodelling while the elastic stretch is
@@ -642,10 +646,12 @@ int main(int argc, char *argv[])
     myTissue.time       = 0.0;   // was never initialized: the solver reads it
     myTissue.time_step  = 0.2;
     myTissue.tol        = 1e-8;
-    myTissue.max_iter   = 60;    // damped Newton needs room during the puncture
-                                 // snap-open; an unconverged step is now
-                                 // rejected rather than accepted, so this only
-                                 // controls when dt starts halving.
+    // Newton converges LINEARLY (not quadratically) on the stiff
+    // alpha-driven cytokine surge, reaching ~1e-6 by iteration 60. Rejecting
+    // there costs a 5x dt cut; giving it more iterations is much cheaper, so
+    // this is generous. An unconverged step is still rejected rather than
+    // accepted.
+    myTissue.max_iter   = (int)env_dbl("WOUND_MAXITER", 200);
     myTissue.n_node     = myMesh.n_nodes;
     myTissue.n_vol_elem = myMesh.n_elements;
     myTissue.n_surf_elem= myMesh.n_surf_elements;
@@ -876,7 +882,11 @@ int main(int argc, char *argv[])
     // clock for 0.4 h of simulated time; the ladder below covers the same
     // transient in ~40 cheap steps.
     const double dt_normal = myTissue.time_step;
-    const int    n_rung    = (int)env_dbl("WOUND_RUNGS",   10);  // steps per rung
+    // Steps per rung. The ladder must span the steep part of the
+    // alpha-driven cytokine surge, not merely the mechanical snap-open:
+    // p_c_alpha*alpha is ~48x the cytokine decay term, driving c from 1 toward
+    // ~48 over a few hours, which is what stalled a 10-step ladder.
+    const int    n_rung    = (int)env_dbl("WOUND_RUNGS",   40);  // steps per rung
     const double dt_start  = env_dbl("WOUND_DTRAMP", 0.002);
     double t_ramp_total = 0.0;
     if(dt_start > 0.0 && dt_start < dt_normal && n_rung > 0){
