@@ -760,7 +760,32 @@ int main(int argc, char *argv[])
     //
     // so sev ~ 1 on the axis, 1/2 at r_wound, ~0 beyond, over a transition of
     // roughly two elements.
-    const double w_smooth = env_dbl("WOUND_WSMOOTH", 0.06);   // [mm]
+    // The smoothing width must be RESOLVED by the mesh, otherwise the smooth
+    // profile is itself a step as far as the discretization is concerned. A
+    // first attempt used a fixed 0.06 mm, which on this mesh is only 0.67 of an
+    // element edge (0.089 mm) and still produced undershoot. Scale it from the
+    // actual element size instead, so it travels across meshes.
+    double mean_edge = 0.0;
+    {
+        long ne = 0;
+        const int nsample = std::min(myMesh.n_elements, 4000);
+        for(int e=0;e<nsample;e++){
+            const std::vector<int>& el = myMesh.elements[e];
+            for(size_t a=0;a<el.size();a++)
+                for(size_t b=a+1;b<el.size();b++){
+                    mean_edge += (myMesh.nodes[el[a]] - myMesh.nodes[el[b]]).norm();
+                    ne++;
+                }
+        }
+        if(ne) mean_edge /= (double)ne;
+    }
+    const double w_smooth = env_dbl("WOUND_WSMOOTH", 1.7*mean_edge);   // [mm]
+    std::cout<<"mean element edge "<<mean_edge<<" mm; wound radius "<<r_wound
+             <<" mm ("<<r_wound/mean_edge<<" elements); smoothing width "
+             <<w_smooth<<" mm ("<<w_smooth/mean_edge<<" elements)\n";
+    if(w_smooth < 1.2*mean_edge)
+        std::cout<<"  *** WARNING: smoothing width under-resolved; expect "
+                   "Galerkin undershoot at the wound edge ***\n";
     auto severity = [&](const Vector3d& x){
         if(x(0) < Xmin_wound || x(0) > Xmax_wound) return 0.0;
         const double r = std::sqrt((x(1)-y_center)*(x(1)-y_center)
