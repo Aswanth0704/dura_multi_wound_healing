@@ -631,7 +631,10 @@ int main(int argc, char *argv[])
     myTissue.time       = 0.0;   // was never initialized: the solver reads it
     myTissue.time_step  = 0.2;
     myTissue.tol        = 1e-8;
-    myTissue.max_iter   = 25;
+    myTissue.max_iter   = 60;    // damped Newton needs room during the puncture
+                                 // snap-open; an unconverged step is now
+                                 // rejected rather than accepted, so this only
+                                 // controls when dt starts halving.
     myTissue.n_node     = myMesh.n_nodes;
     myTissue.n_vol_elem = myMesh.n_elements;
     myTissue.n_surf_elem= myMesh.n_surf_elements;

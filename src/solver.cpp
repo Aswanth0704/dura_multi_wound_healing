@@ -997,8 +997,15 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 			iter += 1;
 
             // ADAPTIVE TIME STEP FOR NON-CONVERGED ITERATIONS
-			if(iter == myTissue.max_iter){
-			    std::cout<<"\nCheck, make sure residual is small enough\n";
+			if(iter == myTissue.max_iter && residuum > myTissue.tol){
+			    // Do NOT accept an unconverged step. Rejecting it here and
+			    // halving dt below is what makes the puncture snap-open
+			    // resolvable: accepting it produced concentrations as low as
+			    // -1.66 (the transport equations have no positivity limiter,
+			    // so an unconverged increment shows up as negative species).
+			    std::cout<<"\nmax_iter reached with residual "<<residuum
+			             <<" > tol "<<myTissue.tol<<" - rejecting the step\n";
+			    reset = true;
 			    // Slow down but keep going forward
                 /*std::cout << "Decreasing time step" << "\n";
                 if(slow_iter == 0){
@@ -1033,7 +1040,7 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 slow_iter = slow_iter*slowdown;
                 total_slowdown = total_slowdown*slowdown;
 
-                if(total_slowdown > pow(slowdown,3)){
+                if(total_slowdown > pow(slowdown,6)){
                     throw std::runtime_error("Solver failed too many times!");
                     break;
                 }
