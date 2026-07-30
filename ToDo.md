@@ -142,6 +142,16 @@ inside an `omp critical`, so scaling saturates (observed 350–530% of 1200%).
   edges rather than 1.7). That is physically defensible, since the inflammatory
   signal begins diffusing from the injury immediately and its initial footprint
   is broader than the mechanical damage.
+- **`time_step_ratio = 100` is ~4x more local substeps than needed** and is the
+  dominant runtime cost, especially now that tets carry 4 integration points
+  instead of 1. Per global time step the solver does
+  `100 substeps x 79,364 IPs x ~6 Newton iterations ~ 48 million` local
+  forward-Euler updates. The binding local timescale is `tau_lamdaP` = 0.05 h;
+  at `ratio = 100`, `local_dt` = 0.002 h is 25x finer than that. `ratio = 25`
+  gives `local_dt` = 0.008 h (0.16 of the binding timescale — still comfortable
+  for forward Euler) and would cut wall time ~4x. Worth changing before any
+  production run on the 20t mesh. Note the Newton solve itself is NOT the
+  bottleneck: healing steps converge in 6–7 iterations at residual ~1e-9.
 - **`k_cut = 300` makes `C_low` a near-step** (0.0025 → 0.5 → 0.9975 across
   φ = 0 → 0.01 → 0.02, slope ~150 at φ = 0.01). It works, but if convergence
   degrades on finer meshes this is the first thing to soften.
