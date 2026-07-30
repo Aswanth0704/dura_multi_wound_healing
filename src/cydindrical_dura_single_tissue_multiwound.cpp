@@ -202,10 +202,11 @@ static void reportState(const tissue& myTissue, const std::vector<Vector4d>& IP,
         for(double x : v){ lo=std::min(lo,x); hi=std::max(hi,x); mean+=x; }
         if(!v.empty()) mean/=(double)v.size();
     };
-    double rlo,rhi,rmean, clo,chi,cmean, plo,phi_hi,pmean;
-    span(myTissue.node_rho, rlo,rhi,rmean);
-    span(myTissue.node_c,   clo,chi,cmean);
-    span(myTissue.ip_phif,  plo,phi_hi,pmean);
+    double rlo,rhi,rmean, clo,chi,cmean, plo,phi_hi,pmean, alo,ahi,amean;
+    span(myTissue.node_rho,   rlo,rhi,rmean);
+    span(myTissue.node_c,     clo,chi,cmean);
+    span(myTissue.ip_phif,    plo,phi_hi,pmean);
+    span(myTissue.node_alpha, alo,ahi,amean);
 
     std::cout<<"\n================ STATE REPORT: "<<label<<" ================\n";
     std::cout<<std::fixed<<std::setprecision(6);
@@ -215,7 +216,8 @@ static void reportState(const tissue& myTissue, const std::vector<Vector4d>& IP,
     std::cout<<"  rho      min/mean/max : "<<rlo<<" / "<<rmean<<" / "<<rhi<<"\n";
     std::cout<<"  c        min/mean/max : "<<clo<<" / "<<cmean<<" / "<<chi<<"\n";
     std::cout<<"  phi      min/mean/max : "<<plo<<" / "<<pmean<<" / "<<phi_hi<<"\n";
-    if(rlo<0.0 || clo<0.0 || plo<0.0)
+    std::cout<<"  alpha    min/mean/max : "<<alo<<" / "<<amean<<" / "<<ahi<<"\n";
+    if(rlo<0.0 || clo<0.0 || plo<0.0 || alo<0.0)
         std::cout<<"  *** WARNING: negative concentration - solver has no clamping ***\n";
     std::cout<<"===========================================================\n\n";
     std::cout.unsetf(std::ios::fixed);
@@ -251,11 +253,19 @@ int main(int argc, char *argv[])
     double rho_wound   = 1.0e-4;
     double c_wound     = 1.0e-4;
     double phif0_wound = 1.0e-2;
+    // Injury releases the pro-inflammatory signal, so alpha starts HIGH in the
+    // wound and decays (half-life ln2/d_alpha ~ 54 h), driving cytokine
+    // production through p_c_alpha.
+    double alpha_wound = 1.0;
     double kappa0_wound = 1./3;      // uniform dispersion
 
     // values for the healthy tissue
     double rho_healthy   = rho_h;
     double c_healthy     = c_h;
+    // alpha_h = 0 exactly. Nothing divides by alpha, and zero is the exact fixed
+    // point of s_alpha = -d_alpha alpha, so (0,1,1,1) is preserved and the
+    // p_c_alpha term drops out of the derived p_c_rho.
+    double alpha_healthy = 0.0;
     double phif0_healthy = phi_h;
     double kappa0_healthy = 0.024;   // fiber dispersion, from our own experiments
 
@@ -308,6 +318,14 @@ int main(int argc, char *argv[])
 
     double bx = 0.0, by = 0.0, bz = 0.0;    // body force
 
+    // --- pro-inflammatory signal alpha ---
+    // APPENDED at indices 25/26/27: wound.cpp unpacks global_parameters by
+    // literal index at six separate sites, so inserting mid-vector would
+    // silently corrupt every downstream read.
+    double D_alpha   = 0.00930;   // [mm^2/h] taken equal to D_c
+    double d_alpha   = 0.0128;    // [1/h] decay
+    double p_c_alpha = 0.208;     // [1/h] cytokine production driven by alpha
+
     //=======================================================================//
     // LOCAL PARAMETERS
     //=======================================================================//
@@ -350,7 +368,8 @@ int main(int argc, char *argv[])
     //---------------------------------//
     std::vector<double> global_parameters = {k0,kf,k2,t_rho,t_rho_c,K_t,K_t_c,
         D_rhorho,D_rhoc,D_cc,p_rho,p_rho_c,p_rho_theta,K_rho_c,K_rho_rho,d_rho,
-        vartheta_e,gamma_theta,p_c_rho,p_c_thetaE,K_c_c,d_c,bx,by,bz};
+        vartheta_e,gamma_theta,p_c_rho,p_c_thetaE,K_c_c,d_c,bx,by,bz,
+        D_alpha,d_alpha,p_c_alpha};
 
     // fiber reorientation / dispersion time constants, co-scaled with K_phi_rho
     double tau_omega = 10./(K_phi_rho+1);
@@ -395,7 +414,8 @@ int main(int argc, char *argv[])
     const char* gnames[] = {"k0","kf","k2","t_rho","t_rho_c","K_t","K_t_c",
         "D_rhorho(unused)","D_rhoc","D_cc","p_rho","p_rho_c","p_rho_theta",
         "K_rho_c","K_rho_rho*","d_rho","vartheta_e","gamma_theta","p_c_rho*",
-        "p_c_thetaE*","K_c_c","d_c","bx","by","bz"};
+        "p_c_thetaE*","K_c_c","d_c","bx","by","bz",
+        "D_alpha","d_alpha","p_c_alpha"};
     for(size_t i=0;i<global_parameters.size();i++)
         std::cout<<"  global["<<std::setw(2)<<i<<"] "<<std::setw(18)<<gnames[i]
                  <<" = "<<global_parameters[i]<<"\n";
@@ -530,6 +550,7 @@ int main(int argc, char *argv[])
     //=======================================================================//
     std::vector<double> node_rho0(myMesh.n_nodes, rho_healthy);
     std::vector<double> node_c0  (myMesh.n_nodes, c_healthy);
+    std::vector<double> node_alpha0(myMesh.n_nodes, alpha_healthy);
     std::vector<double> ip_phi0  (myMesh.n_elements*IP_size, phif0_healthy);
     std::vector<double> ip_kappa0(myMesh.n_elements*IP_size, kappa0_healthy);
     Vector3d a0_healthy(0.,0.,1.);            // collagen along the axis
@@ -563,7 +584,7 @@ int main(int argc, char *argv[])
     //=======================================================================//
     // BOUNDARY CONDITIONS - phase 1: prestretch held on the whole boundary
     //=======================================================================//
-    std::map<int,double> eBC_x, eBC_rho, eBC_c;
+    std::map<int,double> eBC_x, eBC_rho, eBC_c, eBC_alpha;
     for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
         if(!on_boundary[nodei]) continue;
         if(verbose) std::cout<<"fixing node "<<nodei<<"\n";
@@ -575,9 +596,10 @@ int main(int argc, char *argv[])
         if(myMesh.boundary_flag[nodei] == 1){
             eBC_rho.insert(std::pair<int,double>(nodei, rho_healthy));
             eBC_c.insert  (std::pair<int,double>(nodei, c_healthy));
+            eBC_alpha.insert(std::pair<int,double>(nodei, alpha_healthy));
         }
     }
-    std::map<int,double> nBC_x, nBC_rho, nBC_c;   // unused: never read by the solver
+    std::map<int,double> nBC_x, nBC_rho, nBC_c, nBC_alpha; // unused: never read by the solver
 
     //=======================================================================//
     // ASSEMBLE THE TISSUE
@@ -593,6 +615,7 @@ int main(int argc, char *argv[])
     myTissue.node_x = node_target;           // start at the prestretched guess
     myTissue.node_rho_0 = node_rho0;  myTissue.node_rho = node_rho0;
     myTissue.node_c_0   = node_c0;    myTissue.node_c   = node_c0;
+    myTissue.node_alpha_0 = node_alpha0; myTissue.node_alpha = node_alpha0;
     myTissue.ip_phif_0  = ip_phi0;    myTissue.ip_phif  = ip_phi0;
     myTissue.ip_a0_0    = ip_a00;     myTissue.ip_a0    = ip_a00;
     myTissue.ip_s0_0    = ip_s00;     myTissue.ip_s0    = ip_s00;
@@ -603,7 +626,9 @@ int main(int argc, char *argv[])
     myTissue.ip_strain = std::vector<Matrix3d>(myMesh.n_elements*IP_size, Matrix3d::Identity());
     myTissue.ip_stress = std::vector<Matrix3d>(myMesh.n_elements*IP_size, Matrix3d::Zero());
     myTissue.eBC_x = eBC_x;  myTissue.eBC_rho = eBC_rho;  myTissue.eBC_c = eBC_c;
+    myTissue.eBC_alpha = eBC_alpha;
     myTissue.nBC_x = nBC_x;  myTissue.nBC_rho = nBC_rho;  myTissue.nBC_c = nBC_c;
+    myTissue.nBC_alpha = nBC_alpha;
     myTissue.time       = 0.0;   // was never initialized: the solver reads it
     myTissue.time_step  = 0.2;
     myTissue.tol        = 1e-8;
@@ -674,7 +699,7 @@ int main(int argc, char *argv[])
     const double patch_mult   = env_dbl("WOUND_PATCH", 4.0);
     const double patch_radius = patch_mult*r_wound;
     {
-        std::map<int,double> eBC_x2, eBC_rho2, eBC_c2;
+        std::map<int,double> eBC_x2, eBC_rho2, eBC_c2, eBC_alpha2;
         int n_freed = 0;
         for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
             if(!on_boundary[nodei]) continue;
@@ -691,6 +716,7 @@ int main(int argc, char *argv[])
             if(myMesh.boundary_flag[nodei] == 1){
                 eBC_rho2.insert(std::pair<int,double>(nodei, rho_healthy));
                 eBC_c2.insert  (std::pair<int,double>(nodei, c_healthy));
+                eBC_alpha2.insert(std::pair<int,double>(nodei, alpha_healthy));
             }
         }
         std::cout<<"\nfree patch radius "<<patch_radius<<" mm ("<<patch_mult
@@ -698,6 +724,7 @@ int main(int argc, char *argv[])
         myTissue.eBC_x = eBC_x2;
         myTissue.eBC_rho = eBC_rho2;
         myTissue.eBC_c = eBC_c2;
+        myTissue.eBC_alpha = eBC_alpha2;
         // Rebuild the dof maps for the new constraint set. fillDOFmap rebuilds
         // dof_fwd_map_*, dof_inv_map and n_dof from scratch, so this is safe.
         fillDOFmap(myTissue);
@@ -720,6 +747,8 @@ int main(int argc, char *argv[])
             myTissue.node_rho[nodei]   = rho_wound;
             myTissue.node_c_0[nodei]   = c_wound;
             myTissue.node_c[nodei]     = c_wound;
+            myTissue.node_alpha_0[nodei] = alpha_wound;
+            myTissue.node_alpha[nodei]   = alpha_wound;
             n_wound_nodes++;
         }
     }

@@ -31,17 +31,18 @@ void evalWound(
         double dt, double time, double time_final,
         const std::vector<Matrix3d> &ip_Jac,
         const std::vector<double> &global_parameters,const std::vector<double> &local_parameters,
-        std::vector<Matrix3d> &ip_strain,std::vector<Matrix3d> &ip_stress, const std::vector<double> &node_rho_0, const std::vector<double> &node_c_0, //
+        std::vector<Matrix3d> &ip_strain,std::vector<Matrix3d> &ip_stress, const std::vector<double> &node_rho_0, const std::vector<double> &node_c_0, const std::vector<double> &node_alpha_0, //
         const std::vector<double> &ip_phif_0,const std::vector<Vector3d> &ip_a0_0,const std::vector<Vector3d> &ip_s0_0,const std::vector<Vector3d> &ip_n0_0,const std::vector<double> &ip_kappa_0, const std::vector<Vector3d> &ip_lamdaP_0, //
-        const std::vector<double> &node_rho, const std::vector<double> &node_c,
+        const std::vector<double> &node_rho, const std::vector<double> &node_c, const std::vector<double> &node_alpha,
         std::vector<double> &ip_phif, std::vector<Vector3d> &ip_a0, std::vector<Vector3d> &ip_s0, std::vector<Vector3d> &ip_n0, std::vector<double> &ip_kappa, std::vector<Vector3d> &ip_lamdaP, //
         std::vector<Vector3d> &ip_lamdaE,
         const std::vector<Vector3d> &node_x,
         const std::vector<Vector3d> &node_X,
         std::vector<Vector3d> &ip_dphifdu, std::vector<double> &ip_dphifdrho, std::vector<double> &ip_dphifdc,
-        VectorXd &Re_x,MatrixXd &Ke_x_x,MatrixXd &Ke_x_rho,MatrixXd &Ke_x_c,
-        VectorXd &Re_rho,MatrixXd &Ke_rho_x, MatrixXd &Ke_rho_rho,MatrixXd &Ke_rho_c,
-        VectorXd &Re_c,MatrixXd &Ke_c_x,MatrixXd &Ke_c_rho,MatrixXd &Ke_c_c)
+        VectorXd &Re_x,MatrixXd &Ke_x_x,MatrixXd &Ke_x_rho,MatrixXd &Ke_x_c,MatrixXd &Ke_x_alpha,
+        VectorXd &Re_rho,MatrixXd &Ke_rho_x, MatrixXd &Ke_rho_rho,MatrixXd &Ke_rho_c,MatrixXd &Ke_rho_alpha,
+        VectorXd &Re_c,MatrixXd &Ke_c_x,MatrixXd &Ke_c_rho,MatrixXd &Ke_c_c,MatrixXd &Ke_c_alpha,
+        VectorXd &Re_alpha,MatrixXd &Ke_alpha_x,MatrixXd &Ke_alpha_rho,MatrixXd &Ke_alpha_c,MatrixXd &Ke_alpha_alpha)
 {
 
     //std::cout<<"element routine\n";
@@ -98,6 +99,11 @@ void evalWound(
     double bx = global_parameters[22]; // body force
     double by = global_parameters[23]; // body force
     double bz = global_parameters[24]; // body force
+    // alpha (pro-inflammatory signal). APPENDED at the end so that every
+    // existing literal index into global_parameters stays valid.
+    double D_alpha   = (global_parameters.size()>25) ? global_parameters[25] : 0.0;
+    double d_alpha   = (global_parameters.size()>26) ? global_parameters[26] : 0.0;
+    double p_c_alpha = (global_parameters.size()>27) ? global_parameters[27] : 0.0;
     //std::cout<<"read all global parameters\n";
     //
     //---------------------------------//
@@ -110,6 +116,9 @@ void evalWound(
     Re_x.setZero(); Ke_x_x.setZero(); Ke_x_rho.setZero(); Ke_x_c.setZero();
     Re_rho.setZero(); Ke_rho_x.setZero(); Ke_rho_rho.setZero(); Ke_rho_c.setZero();
     Re_c.setZero(); Ke_c_x.setZero(); Ke_c_rho.setZero(); Ke_c_c.setZero();
+    Ke_x_alpha.setZero(); Ke_rho_alpha.setZero(); Ke_c_alpha.setZero();
+    Re_alpha.setZero(); Ke_alpha_x.setZero(); Ke_alpha_rho.setZero();
+    Ke_alpha_c.setZero(); Ke_alpha_alpha.setZero();
     int elem_size = node_x.size();
     std::vector<Vector3d> Ebasis; Ebasis.clear();
     Ebasis.push_back(Vector3d(1.,0.,0.)); Ebasis.push_back(Vector3d(0.,1.,0.)); Ebasis.push_back(Vector3d(0.,0.,1.));
@@ -205,6 +214,8 @@ void evalWound(
         double rho=0.; Vector3d drhodXi; drhodXi.setZero();
         double c_0=0.; Vector3d dc0dXi; dc0dXi.setZero();
         double c=0.; Vector3d dcdXi; dcdXi.setZero();
+        double alpha_0=0.; Vector3d dalpha0dXi; dalpha0dXi.setZero();
+        double alpha=0.;   Vector3d dalphadXi;  dalphadXi.setZero();
         //
         for(int ni=0;ni<elem_size;ni++)
         {
@@ -236,6 +247,16 @@ void evalWound(
             dcdXi(0) += node_c[ni]*Rxi[ni];
             dcdXi(1) += node_c[ni]*Reta[ni];
             dcdXi(2) += node_c[ni]*Rzeta[ni];
+
+            alpha_0 += node_alpha_0[ni]*R[ni];
+            dalpha0dXi(0) += node_alpha_0[ni]*Rxi[ni];
+            dalpha0dXi(1) += node_alpha_0[ni]*Reta[ni];
+            dalpha0dXi(2) += node_alpha_0[ni]*Rzeta[ni];
+
+            alpha += node_alpha[ni]*R[ni];
+            dalphadXi(0) += node_alpha[ni]*Rxi[ni];
+            dalphadXi(1) += node_alpha[ni]*Reta[ni];
+            dalphadXi(2) += node_alpha[ni]*Rzeta[ni];
         }
         //
         //---------------------------------//
@@ -269,6 +290,8 @@ void evalWound(
         Vector3d Grad_rho = ip_Jac[ip]*drhodXi;
         Vector3d Grad_c0 = ip_Jac[ip]*dc0dXi;
         Vector3d Grad_c = ip_Jac[ip]*dcdXi;
+        Vector3d Grad_alpha0 = ip_Jac[ip]*dalpha0dXi;
+        Vector3d Grad_alpha  = ip_Jac[ip]*dalphadXi;
         //
         // Gradient of basis functions for the nodes in reference
         std::vector<Vector3d> Grad_R;Grad_R.clear();
@@ -575,7 +598,20 @@ void evalWound(
         // function for elastic response of the cells
         double S_rho = (p_rho + p_rho_c*c/(K_rho_c+c) + p_rho_theta*He)*(1-rho/K_rho_rho)*rho - d_rho*rho;
         // function for elastic response of the chemical
-        double S_c = (p_c_rho*c+ p_c_thetaE*He)*(rho/(K_c_c+c)) - d_c*c;
+        // Cytokine source gains the pro-inflammatory drive p_c_alpha*alpha.
+        // At homeostasis alpha_h = 0 so this term vanishes and the derived
+        // p_c_rho still makes (0,1,1,1) an exact fixed point.
+        double S_c = (p_c_rho*c+ p_c_thetaE*He)*(rho/(K_c_c+c)) - d_c*c + p_c_alpha*alpha;
+
+        //------------------//
+        // ALPHA: pro-inflammatory signal
+        //   alpha_dot + div(Q_alpha) = s_alpha,  Q_alpha = -D_alpha grad(alpha),
+        //   s_alpha = -d_alpha alpha
+        // No dependence on phif, a0, kappa or lamdaP, so this needs no new
+        // structural sensitivities.
+        //------------------//
+        Vector3d Q_alpha = -D_alpha*CCinv*Grad_alpha;
+        double S_alpha = -d_alpha*alpha;
         //std::cout<<"SS_voigt\n"<<SS_voigt<<"\n";
         //std::cout<<"flux of cells, Q _rho\n"<<Q_rho<<"\n";
         //std::cout<<"source of cells, S_rho: "<<S_rho<<"\n";
@@ -614,6 +650,7 @@ void evalWound(
             // Element residuals for rho and c
             Re_rho(nodei) += Jac*(((rho-rho_0)/dt - S_rho)*R[nodei] - Grad_R[nodei].dot(Q_rho))*wip;
             Re_c(nodei) += Jac*(((c-c_0)/dt - S_c)*R[nodei] - Grad_R[nodei].dot(Q_c))*wip;
+            Re_alpha(nodei) += Jac*(((alpha-alpha_0)/dt - S_alpha)*R[nodei] - Grad_R[nodei].dot(Q_alpha))*wip;
             // GGLS stabilization
             //Re_rho(nodei) += Jac*(((Grad_rho-Grad_rho_0)/dt - Grad_S_rho)*tau*(Grad_S_N))*wip;
         }
@@ -974,6 +1011,11 @@ void evalWound(
         Vector3d linQ_rhodrho = -D_rhoc*CCinv*Grad_c;
         Matrix3d linQ_rhodGradc = -D_rhoc*rho*CCinv;
         Matrix3d linQ_cdGradc = -D_cc*CCinv;
+        // alpha: Q_alpha = -D_alpha CCinv Grad_alpha with D_alpha constant, so
+        // the only field linearization is with respect to Grad_alpha.
+        Matrix3d linQ_alphadGradalpha = -D_alpha*CCinv;
+        double   dS_alphadalpha = -d_alpha;
+        double   dS_cdalpha     = p_c_alpha;
         //
         // explicit derivatives of source terms
         double dS_rhodrho_explicit = (p_rho + p_rho_c*c/(K_rho_c+c)+p_rho_theta*He)*(1-rho/K_rho_rho) - d_rho + rho*(p_rho + p_rho_c*c/(K_rho_c+c)+p_rho_theta*He)*(-1./K_rho_rho);
@@ -1002,6 +1044,7 @@ void evalWound(
         // FLUX TERMS
         std::vector<double> dQ_rhodCC_explicit(27,0.);
         std::vector<double> dQ_cdCC_explicit(27,0.);
+        std::vector<double> dQ_alphadCC_explicit(27,0.);
         for(int ii=0;ii<3;ii++) {
             for(int jj=0;jj<3;jj++) {
                 for(int kk=0;kk<3;kk++) {
@@ -1016,6 +1059,9 @@ void evalWound(
 
                         dQ_cdCC_explicit[ii*9+kk*3+ll] += -0.5*(-1.0*(D_cc-phif*(D_cc-D_cc/10)))*(CCinv(ii,kk)*CCinv(jj,ll)+CCinv(jj,kk)*CCinv(ii,ll))*Grad_c(jj);
 
+                        // alpha: Q_alpha = -D_alpha CCinv Grad_alpha, same form
+                        dQ_alphadCC_explicit[ii*9+kk*3+ll] += -0.5*(-1.0*D_alpha)*(CCinv(ii,kk)*CCinv(jj,ll)+CCinv(jj,kk)*CCinv(ii,ll))*Grad_alpha(jj);
+
                         //dQ_cdCC_explicit[ii*9+kk*3+ll] += -1.0*(-3*(D_cc-phif*(D_cc-D_cc/10))*A0(ii,jj)*Grad_c(jj))
                         //       *dtrAdCC(kk,ll)/(trA*trA);
 
@@ -1029,6 +1075,7 @@ void evalWound(
         MatrixXd dQ_rhodCC_explicit_voigt(3,6); dQ_rhodCC_explicit_voigt.setZero();
         MatrixXd dQ_rhodCC_structural_voigt(3,6); dQ_rhodCC_structural_voigt.setZero();
         MatrixXd dQ_cdCC_voigt(3,6); dQ_cdCC_voigt.setZero();
+        MatrixXd dQ_alphadCC_voigt(3,6); dQ_alphadCC_voigt.setZero();
         MatrixXd dQ_cdCC_explicit_voigt(3,6); dQ_cdCC_explicit_voigt.setZero();
         MatrixXd dQ_cdCC_structural_voigt(3,6); dQ_cdCC_structural_voigt.setZero();
         VectorXd dS_rhodCC_explicit_voigt(6); dS_rhodCC_explicit_voigt.setZero();
@@ -1070,6 +1117,9 @@ void evalWound(
                           + dQ_cdlamdaPs(ii)*dlamdaP_sdCC(kk,ll) + dQ_cdlamdaPn(ii)*dlamdaP_ndCC(kk,ll);
 
                 dQ_cdCC_voigt(II,JJ) = dQ_cdCC_explicit_voigt(II,JJ) + dQ_cdCC_structural_voigt(II,JJ);
+                // alpha has no phif/a0/kappa/lamdaP dependence, so there is no
+                // structural contribution here - only the explicit CC one.
+                dQ_alphadCC_voigt(II,JJ) = dQ_alphadCC_explicit[ii*9+kk*3+ll];
 
                 dS_rhodCC_explicit_voigt(JJ) = dS_rhodCC_explicit(kk,ll);
 
@@ -1141,6 +1191,10 @@ void evalWound(
 
                     Ke_c_x(nodei,nodej*3+coordj) += -(R[nodei]*dS_cdCC_voigt.dot(linCC_voigt) + Grad_R[nodei].dot(dQ_cdCC_voigt*linCC_voigt))*Jac*wip;
 
+                    // Ke_alpha_x: only the flux couples to the deformation,
+                    // because s_alpha = -d_alpha alpha has no CC dependence.
+                    Ke_alpha_x(nodei,nodej*3+coordj) += -(Grad_R[nodei].dot(dQ_alphadCC_voigt*linCC_voigt))*Jac*wip;
+
                 }
 
                 //-----------//
@@ -1177,6 +1231,25 @@ void evalWound(
                 //-----------//
 
                 Ke_c_c(nodei,nodej) += Jac*(R[nodei]*R[nodej]/dt -1.* R[nodei]*dS_cdc*R[nodej] -1.* Grad_R[nodei].dot(linQ_cdGradc*Grad_R[nodej] + dQ_cdphif*dphifdc*R[nodej]))*wip;
+
+                //-----------//
+                // Ke_c_alpha : cytokine production driven by alpha
+                //-----------//
+
+                Ke_c_alpha(nodei,nodej) += Jac*(-1.*R[nodei]*dS_cdalpha*R[nodej])*wip;
+
+                //-----------//
+                // Ke_alpha_alpha
+                //-----------//
+
+                Ke_alpha_alpha(nodei,nodej) += Jac*(R[nodei]*R[nodej]/dt -1.*R[nodei]*dS_alphadalpha*R[nodej] -1.*Grad_R[nodei].dot(linQ_alphadGradalpha*Grad_R[nodej]))*wip;
+
+                //-----------//
+                // Ke_alpha_rho, Ke_alpha_c : alpha has no rho or c dependence
+                // (s_alpha = -d_alpha alpha, Q_alpha = -D_alpha grad alpha), so
+                // these blocks stay zero. Ke_x_alpha and Ke_rho_alpha likewise:
+                // alpha enters neither the stress nor the fibroblast source.
+                //-----------//
             }
         }
     } // END INTEGRATION loop

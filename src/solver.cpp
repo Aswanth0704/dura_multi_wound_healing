@@ -48,6 +48,7 @@ void fillDOFmap(tissue &myTissue)
 	// concentrations
 	std::vector< int > dof_fwd_map_rho(n_node,-1);
 	std::vector< int > dof_fwd_map_c(n_node,-1);
+	std::vector< int > dof_fwd_map_alpha(n_node,-1);
 		
 	// all dof inverse map
 	std::vector< std::vector<int> > dof_inv_map;
@@ -92,10 +93,21 @@ void fillDOFmap(tissue &myTissue)
 			// this node is in fact in the eBC, 
 			myTissue.node_c[i] = myTissue.eBC_c.find(i)->second;
 		}
+		// pro-inflammatory signal alpha: dof_inv_map tag 3
+		if(myTissue.eBC_alpha.find(i)==myTissue.eBC_alpha.end())
+		{
+			dof_fwd_map_alpha[i] = dof_count;
+			std::vector<int> dofinvalpha = {3,i};
+			dof_inv_map.push_back(dofinvalpha);
+			dof_count+=1;
+		}else{
+			myTissue.node_alpha[i] = myTissue.eBC_alpha.find(i)->second;
+		}
 	}
 	myTissue.dof_fwd_map_x = dof_fwd_map_x;
 	myTissue.dof_fwd_map_rho = dof_fwd_map_rho;
 	myTissue.dof_fwd_map_c = dof_fwd_map_c;
+	myTissue.dof_fwd_map_alpha = dof_fwd_map_alpha;
 	myTissue.dof_inv_map = dof_inv_map;
 	myTissue.n_dof = dof_count;
 }
@@ -397,6 +409,8 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 std::vector<double> node_c_0_ni; node_c_0_ni.clear();
                 std::vector<double> node_rho_ni; node_rho_ni.clear();
                 std::vector<double> node_c_ni; node_c_ni.clear();
+                std::vector<double> node_alpha_0_ni; node_alpha_0_ni.clear();
+                std::vector<double> node_alpha_ni; node_alpha_ni.clear();
 
                 // values of the structural variables at the IP
                 std::vector<double> ip_phif_0_pi; ip_phif_0_pi.clear();
@@ -429,6 +443,8 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                     node_c_0_ni.push_back(myTissue.node_c_0[elem_ei[ni]]);
                     node_rho_ni.push_back(myTissue.node_rho[elem_ei[ni]]);
                     node_c_ni.push_back(myTissue.node_c[elem_ei[ni]]);
+                    node_alpha_0_ni.push_back(myTissue.node_alpha_0[elem_ei[ni]]);
+                    node_alpha_ni.push_back(myTissue.node_alpha[elem_ei[ni]]);
                 }
 
 				for(int ipi=0;ipi<IP_size;ipi++){
@@ -453,6 +469,7 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 VectorXd Re_x(n_coord*elem_size); Re_x.setZero();
                 VectorXd Re_rho(elem_size); Re_rho.setZero();
                 VectorXd Re_c(elem_size); Re_c.setZero();
+                VectorXd Re_alpha(elem_size); Re_alpha.setZero();
 
                 // pieces of the Tangents
                 MatrixXd Ke_x_x(n_coord*elem_size,n_coord*elem_size); Ke_x_x.setZero();
@@ -464,6 +481,13 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 MatrixXd Ke_c_x(elem_size,n_coord*elem_size); Ke_c_x.setZero();
                 MatrixXd Ke_c_rho(elem_size,elem_size); Ke_c_rho.setZero();
                 MatrixXd Ke_c_c(elem_size,elem_size); Ke_c_c.setZero();
+                MatrixXd Ke_x_alpha(n_coord*elem_size,elem_size); Ke_x_alpha.setZero();
+                MatrixXd Ke_rho_alpha(elem_size,elem_size); Ke_rho_alpha.setZero();
+                MatrixXd Ke_c_alpha(elem_size,elem_size); Ke_c_alpha.setZero();
+                MatrixXd Ke_alpha_x(elem_size,n_coord*elem_size); Ke_alpha_x.setZero();
+                MatrixXd Ke_alpha_rho(elem_size,elem_size); Ke_alpha_rho.setZero();
+                MatrixXd Ke_alpha_c(elem_size,elem_size); Ke_alpha_c.setZero();
+                MatrixXd Ke_alpha_alpha(elem_size,elem_size); Ke_alpha_alpha.setZero();
 
             	// subroutines to evaluate the element
             	//
@@ -472,16 +496,17 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             	time_step, time, time_final,
             	myTissue.elem_jac_IP[ei],
             	myTissue.global_parameters,myTissue.local_parameters,
-                ip_strain, ip_stress, node_rho_0_ni,node_c_0_ni, //
+                ip_strain, ip_stress, node_rho_0_ni,node_c_0_ni,node_alpha_0_ni, //
             	ip_phif_0_pi,ip_a0_0_pi,ip_s0_0_pi,ip_n0_0_pi,ip_kappa_0_pi,ip_lamdaP_0_pi, //
-            	node_rho_ni, node_c_ni,
+            	node_rho_ni, node_c_ni, node_alpha_ni,
             	ip_phif_pi,ip_a0_pi,ip_s0_pi,ip_n0_pi,ip_kappa_pi,ip_lamdaP_pi, //
                 ip_lamdaE_pi,
             	node_x_ni,node_X_ni,
                 ip_dphifdu, ip_dphifdrho, ip_dphifdc,
-            	Re_x, Ke_x_x, Ke_x_rho, Ke_x_c,
-            	Re_rho, Ke_rho_x, Ke_rho_rho, Ke_rho_c,
-            	Re_c, Ke_c_x, Ke_c_rho, Ke_c_c);
+            	Re_x, Ke_x_x, Ke_x_rho, Ke_x_c, Ke_x_alpha,
+            	Re_rho, Ke_rho_x, Ke_rho_rho, Ke_rho_c, Ke_rho_alpha,
+            	Re_c, Ke_c_x, Ke_c_rho, Ke_c_c, Ke_c_alpha,
+            	Re_alpha, Ke_alpha_x, Ke_alpha_rho, Ke_alpha_c, Ke_alpha_alpha);
 
 				//std::cout<<"Ke_x_x\n"<<Ke_x_x<<"\n";
 				//std::cout<<"Ke_x_rho\n"<<Ke_x_rho<<"\n";
@@ -542,6 +567,11 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 									T K_x_c_nici_nj = {myTissue.dof_fwd_map_x[elem_ei[nodei]*n_coord+coordi],myTissue.dof_fwd_map_c[elem_ei[nodej]],Ke_x_c(nodei*n_coord+coordi,nodej)};
 									KK_triplets.push_back(K_x_c_nici_nj);
 								}
+								// alpha tangent
+								if(myTissue.dof_fwd_map_alpha[elem_ei[nodej]]>-1){
+									T K_x_alpha_nici_nj = {myTissue.dof_fwd_map_x[elem_ei[nodei]*n_coord+coordi],myTissue.dof_fwd_map_alpha[elem_ei[nodej]],Ke_x_alpha(nodei*n_coord+coordi,nodej)};
+									KK_triplets.push_back(K_x_alpha_nici_nj);
+								}
 							}
 						}
 					}
@@ -564,6 +594,10 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 								T K_rho_c_ni_nj = {myTissue.dof_fwd_map_rho[elem_ei[nodei]],myTissue.dof_fwd_map_c[elem_ei[nodej]],Ke_rho_c(nodei,nodej)};
 								KK_triplets.push_back(K_rho_c_ni_nj);
 							}
+							if(myTissue.dof_fwd_map_alpha[elem_ei[nodej]]>-1){
+								T K_rho_alpha_ni_nj = {myTissue.dof_fwd_map_rho[elem_ei[nodei]],myTissue.dof_fwd_map_alpha[elem_ei[nodej]],Ke_rho_alpha(nodei,nodej)};
+								KK_triplets.push_back(K_rho_alpha_ni_nj);
+							}
 						}
 					}
 					// ASSEMBLE C
@@ -584,6 +618,34 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 							if(myTissue.dof_fwd_map_c[elem_ei[nodej]]>-1){
 								T K_c_c_ni_nj = {myTissue.dof_fwd_map_c[elem_ei[nodei]],myTissue.dof_fwd_map_c[elem_ei[nodej]],Ke_c_c(nodei,nodej)};
 								KK_triplets.push_back(K_c_c_ni_nj);
+							}
+							if(myTissue.dof_fwd_map_alpha[elem_ei[nodej]]>-1){
+								T K_c_alpha_ni_nj = {myTissue.dof_fwd_map_c[elem_ei[nodei]],myTissue.dof_fwd_map_alpha[elem_ei[nodej]],Ke_c_alpha(nodei,nodej)};
+								KK_triplets.push_back(K_c_alpha_ni_nj);
+							}
+						}
+					}
+					// ASSEMBLE ALPHA
+					if(myTissue.dof_fwd_map_alpha[elem_ei[nodei]]>-1){
+						RR(myTissue.dof_fwd_map_alpha[elem_ei[nodei]]) += Re_alpha(nodei);
+						for(int nodej=0;nodej<elem_size;nodej++){
+							for(int coordj=0;coordj<n_coord;coordj++){
+								if(myTissue.dof_fwd_map_x[elem_ei[nodej]*n_coord+coordj]>-1){
+									T K_alpha_x_ni_njcj = {myTissue.dof_fwd_map_alpha[elem_ei[nodei]],myTissue.dof_fwd_map_x[elem_ei[nodej]*n_coord+coordj],Ke_alpha_x(nodei,nodej*n_coord+coordj)};
+									KK_triplets.push_back(K_alpha_x_ni_njcj);
+								}
+							}
+							if(myTissue.dof_fwd_map_rho[elem_ei[nodej]]>-1){
+								T K_alpha_rho_ni_nj = {myTissue.dof_fwd_map_alpha[elem_ei[nodei]],myTissue.dof_fwd_map_rho[elem_ei[nodej]],Ke_alpha_rho(nodei,nodej)};
+								KK_triplets.push_back(K_alpha_rho_ni_nj);
+							}
+							if(myTissue.dof_fwd_map_c[elem_ei[nodej]]>-1){
+								T K_alpha_c_ni_nj = {myTissue.dof_fwd_map_alpha[elem_ei[nodei]],myTissue.dof_fwd_map_c[elem_ei[nodej]],Ke_alpha_c(nodei,nodej)};
+								KK_triplets.push_back(K_alpha_c_ni_nj);
+							}
+							if(myTissue.dof_fwd_map_alpha[elem_ei[nodej]]>-1){
+								T K_alpha_alpha_ni_nj = {myTissue.dof_fwd_map_alpha[elem_ei[nodei]],myTissue.dof_fwd_map_alpha[elem_ei[nodej]],Ke_alpha_alpha(nodei,nodej)};
+								KK_triplets.push_back(K_alpha_alpha_ni_nj);
 							}
 						}
 					}
@@ -927,6 +989,9 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 				}else if(dof_inv_i[0]==2){
 					// C dof
 					myTissue.node_c[dof_inv_i[1]] += SOL(dofi);
+				}else if(dof_inv_i[0]==3){
+					// alpha dof (pro-inflammatory signal)
+					myTissue.node_alpha[dof_inv_i[1]] += SOL(dofi);
 				}
 			}
 			iter += 1;
@@ -986,6 +1051,7 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             {
                 myTissue.node_rho[nodei] = myTissue.node_rho_0[nodei];
                 myTissue.node_c[nodei] = myTissue.node_c_0[nodei] ;
+                myTissue.node_alpha[nodei] = myTissue.node_alpha_0[nodei];
             }
             // reset integration point variables
             for(int elemi=0;elemi<myTissue.n_vol_elem;elemi++)
@@ -1028,6 +1094,7 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 		{
 			myTissue.node_rho_0[nodei] = myTissue.node_rho[nodei];
 			myTissue.node_c_0[nodei] = myTissue.node_c[nodei] ;
+			myTissue.node_alpha_0[nodei] = myTissue.node_alpha[nodei];
 		}
 		// integration point variables
 #pragma omp parallel for

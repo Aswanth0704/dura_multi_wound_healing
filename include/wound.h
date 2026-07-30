@@ -26,16 +26,17 @@ void evalWound(
 double dt, double time, double time_final,
 const std::vector<Matrix3d> &ip_Jac,
 const std::vector<double> &global_parameters,const std::vector<double> &local_parameters,
-std::vector<Matrix3d> &ip_strain,std::vector<Matrix3d> &ip_stress, const std::vector<double> &node_rho_0, const std::vector<double> &node_c_0, //
+std::vector<Matrix3d> &ip_strain,std::vector<Matrix3d> &ip_stress, const std::vector<double> &node_rho_0, const std::vector<double> &node_c_0, const std::vector<double> &node_alpha_0, //
 const std::vector<double> &ip_phif_0,const std::vector<Vector3d> &ip_a0_0,const std::vector<Vector3d> &ip_s0_0,const std::vector<Vector3d> &ip_n0_0,const std::vector<double> &ip_kappa_0, const std::vector<Vector3d> &ip_lamdaP_0, //
-const std::vector<double> &node_rho, const std::vector<double> &node_c,
+const std::vector<double> &node_rho, const std::vector<double> &node_c, const std::vector<double> &node_alpha,
 std::vector<double> &ip_phif, std::vector<Vector3d> &ip_a0, std::vector<Vector3d> &ip_s0, std::vector<Vector3d> &ip_n0, std::vector<double> &ip_kappa, std::vector<Vector3d> &ip_lamdaP, //
 std::vector<Vector3d> &ip_lamdaE,
 const std::vector<Vector3d> &node_x, const std::vector<Vector3d> &node_X,
 std::vector<Vector3d> &ip_dphifdu, std::vector<double> &ip_dphifdrho, std::vector<double> &ip_dphifdc,
-VectorXd &Re_x,MatrixXd &Ke_x_x,MatrixXd &Ke_x_rho,MatrixXd &Ke_x_c,
-VectorXd &Re_rho,MatrixXd &Ke_rho_x, MatrixXd &Ke_rho_rho,MatrixXd &Ke_rho_c,
-VectorXd &Re_c,MatrixXd &Ke_c_x,MatrixXd &Ke_c_rho,MatrixXd &Ke_c_c);
+VectorXd &Re_x,MatrixXd &Ke_x_x,MatrixXd &Ke_x_rho,MatrixXd &Ke_x_c,MatrixXd &Ke_x_alpha,
+VectorXd &Re_rho,MatrixXd &Ke_rho_x, MatrixXd &Ke_rho_rho,MatrixXd &Ke_rho_c,MatrixXd &Ke_rho_alpha,
+VectorXd &Re_c,MatrixXd &Ke_c_x,MatrixXd &Ke_c_rho,MatrixXd &Ke_c_c,MatrixXd &Ke_c_alpha,
+VectorXd &Re_alpha,MatrixXd &Ke_alpha_x,MatrixXd &Ke_alpha_rho,MatrixXd &Ke_alpha_c,MatrixXd &Ke_alpha_alpha);
 //
 //========================================================//
 

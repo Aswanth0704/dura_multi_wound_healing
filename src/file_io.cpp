@@ -583,6 +583,9 @@ void writeTissue(tissue &myTissue, const char* filename,double time)
 	for(int i=0;i<myTissue.node_c_0.size();i++){
 		savefile<<myTissue.node_c_0[i]<<"\n";
 	}
+	for(int i=0;i<myTissue.node_alpha_0.size();i++){
+		savefile<<myTissue.node_alpha_0[i]<<"\n";
+	}
 	for(int i=0;i<myTissue.ip_phif_0.size();i++){
 		savefile<<myTissue.ip_phif_0[i]<<"\n";
 	}
@@ -1314,6 +1317,17 @@ void writeParaview(tissue &myTissue, const char* filename, const char* filename2
         savefile2<<  node_lamdaP[i](0)*node_lamdaP[i](1)*node_lamdaP[i](2) << " " << node_lamdaP[i](0)<<" "<<node_lamdaP[i](1)<<" "<<node_lamdaP[i](2) << "\n";
 	}
 	// write out the fiber direction
+	// Append alpha as its OWN attribute block. The packed SCALARS above is
+	// already at 4 components, which is the legacy-VTK maximum, so it cannot be
+	// widened; legacy VTK does allow several attribute blocks inside one
+	// POINT_DATA section, and a second POINT_DATA line must NOT be emitted.
+	if(myTissue.node_alpha.size() == (size_t)myTissue.n_node){
+		savefile<<"\nSCALARS alpha float 1\nLOOKUP_TABLE default\n";
+		for(int i=0;i<myTissue.n_node;i++){
+			savefile<<myTissue.node_alpha[i]<<"\n";
+		}
+	}
+
 	savefile<<"\nVECTORS a0 float\n";
     savefile2<<"\nVECTORS lamdaE float\n";
 	for(int i=0;i<myTissue.n_node;i++){
