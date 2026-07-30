@@ -50,23 +50,46 @@ include_directories(SYSTEM ${EIGEN_INCLUDE_DIR})
 #   Negishi: /scratch/.../athani_wound_healing_simulations/boost -> parent ".."
 #---------------------------------------------------------------------------#
 set(BOOST_INCLUDE_DIR "" CACHE PATH "Directory containing the boost/ header folder")
-if(NOT BOOST_INCLUDE_DIR)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../boost/algorithm/string.hpp")
-        set(BOOST_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/..")
-    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../boost_1_71_0/boost/algorithm/string.hpp")
-        set(BOOST_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../boost_1_71_0")
-    elseif(EXISTS "/opt/homebrew/include/boost/algorithm/string.hpp")
-        set(BOOST_INCLUDE_DIR "/opt/homebrew/include")
-    elseif(EXISTS "/usr/include/boost/algorithm/string.hpp")
-        set(BOOST_INCLUDE_DIR "/usr/include")
+# A candidate must be COMPLETE, not just have algorithm/string.hpp. The boost
+# tree sitting next to the project on Negishi is a partial copy: it satisfies
+# algorithm/string.hpp but is missing
+# boost/preprocessor/list/detail/fold_left.hpp, which string.hpp pulls in.
+# So probe for a deep header too.
+function(_boost_ok dir out)
+    if(EXISTS "${dir}/boost/algorithm/string.hpp"
+       AND EXISTS "${dir}/boost/preprocessor/list/detail/fold_left.hpp")
+        set(${out} TRUE PARENT_SCOPE)
+    else()
+        set(${out} FALSE PARENT_SCOPE)
     endif()
+endfunction()
+
+if(NOT BOOST_INCLUDE_DIR)
+    foreach(_cand
+            "$ENV{BOOST_ROOT}/include"
+            "/apps/spack/negishi/apps/boost/1.80.0-gcc-12.2.0-hk67id6/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../boost_1_71_0"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.."
+            "/opt/homebrew/include"
+            "/usr/include")
+        if(NOT BOOST_INCLUDE_DIR)
+            _boost_ok("${_cand}" _ok)
+            if(_ok)
+                set(BOOST_INCLUDE_DIR "${_cand}")
+            endif()
+        endif()
+    endforeach()
 endif()
-if(NOT BOOST_INCLUDE_DIR OR NOT EXISTS "${BOOST_INCLUDE_DIR}/boost/algorithm/string.hpp")
+_boost_ok("${BOOST_INCLUDE_DIR}" _boost_final_ok)
+if(NOT BOOST_INCLUDE_DIR OR NOT _boost_final_ok)
     message(FATAL_ERROR
-        "Could not locate Boost headers. Pass -DBOOST_INCLUDE_DIR=<dir containing boost/>.")
+        "Could not locate a complete Boost. Pass -DBOOST_INCLUDE_DIR=<dir containing boost/>. "
+        "On Negishi: module load boost/1.80.0 and use its include directory.")
 endif()
 message(STATUS "Boost include dir: ${BOOST_INCLUDE_DIR}")
-include_directories(SYSTEM ${BOOST_INCLUDE_DIR})
+# BEFORE matters: the Eigen directory is the project parent, which also contains
+# the incomplete ../boost. Without BEFORE that partial tree would shadow this one.
+include_directories(BEFORE SYSTEM ${BOOST_INCLUDE_DIR})
 
 #---------------------------------------------------------------------------#
 # OpenMP
@@ -134,4 +157,8 @@ add_executable(test_diffusivity EXCLUDE_FROM_ALL tests/test_diffusivity.cpp)
 target_compile_features(test_diffusivity PRIVATE cxx_std_17)
 add_test(NAME diffusivity COMMAND test_diffusivity)
 
-add_custom_target(tests DEPENDS test_mechanosensing test_diffusivity)
+add_executable(test_homeostasis EXCLUDE_FROM_ALL tests/test_homeostasis.cpp)
+target_compile_features(test_homeostasis PRIVATE cxx_std_17)
+add_test(NAME homeostasis COMMAND test_homeostasis)
+
+add_custom_target(tests DEPENDS test_mechanosensing test_diffusivity test_homeostasis)

@@ -38,6 +38,7 @@
 #include "element_functions.h"
 #include "local_solver.h"
 #include "mechanosensing.h"
+#include "homeostasis.h"
 #include <iostream>
 #include <iomanip>
 #include <fstream>
@@ -343,17 +344,13 @@ int main(int argc, char *argv[])
     // Computed from the closed forms rather than hard-coded, so that any later
     // change to a sampled parameter automatically keeps homeostasis exact.
 
-    // Fibroblast carrying capacity, from s_rho = 0.
-    double prolif_h  = p_rho + p_rho_c*c_h/(K_rho_c+c_h) + p_rho_theta*H_h;
-    double K_rho_rho = rho_h/(1.0 - d_rho/prolif_h);
-
-    // Collagen saturation by rho, from phi_dot = 0.
-    double K_phi_rho = (p_phi + p_phi_c*c_h/(K_phi_c+c_h) + p_phi_theta*H_h)*rho_h
-                     / ((d_phi + c_h*rho_h*d_phi_rho_c)*phi_h) - phi_h;
-
-    // Cytokine baseline production, from s_c = 0 (the alpha term vanishes
-    // because alpha_h = 0). We sample K_c_c and back-solve p_c_rho.
-    double p_c_rho    = d_c*(K_c_c + 1.0)/(1.0 + H_h*r_c_e);
+    // Closed forms live in include/homeostasis.h so the unit test and the
+    // driver share one definition.
+    double K_rho_rho = deriveKrhorho(p_rho,p_rho_c,p_rho_theta,K_rho_c,d_rho,
+                                     rho_h,c_h,H_h);
+    double K_phi_rho = deriveKphirho(p_phi,p_phi_c,p_phi_theta,K_phi_c,
+                                     d_phi,d_phi_rho_c,rho_h,c_h,phi_h,H_h);
+    double p_c_rho    = derivePcrho(d_c,K_c_c,r_c_e,H_h);
     double p_c_thetaE = r_c_e*p_c_rho;
 
     // Admissibility. plan.md warns that a GP fit once returned K_phi_rho =
@@ -429,18 +426,20 @@ int main(int argc, char *argv[])
     std::cout<<"  (* = derived to enforce homeostasis)\n";
 
     {
-        // Residuals of the three source terms at (alpha,rho,c,phi)=(0,1,1,1),H=1/2.
-        double S_rho = (p_rho + p_rho_c*c_h/(K_rho_c+c_h) + p_rho_theta*H_h)
-                       *(1.0-rho_h/K_rho_rho)*rho_h - d_rho*rho_h;
-        double S_c   = (p_c_rho*c_h + p_c_thetaE*H_h)*(rho_h/(K_c_c+c_h)) - d_c*c_h;
-        double S_phi = (p_phi + p_phi_c*c_h/(K_phi_c+c_h) + p_phi_theta*H_h)
-                       *(rho_h/(K_phi_rho+phi_h))
-                       - (d_phi + c_h*rho_h*d_phi_rho_c)*phi_h;
-        std::cout<<"\n  Fixed-point residuals at (rho,c,phi)=(1,1,1), H=1/2:\n";
-        std::cout<<"    s_rho = "<<S_rho<<"\n    s_c   = "<<S_c
-                 <<"\n    s_phi = "<<S_phi<<"\n";
+        // Residuals of all four source terms at (alpha,rho,c,phi)=(0,1,1,1),H=1/2.
+        double S_rho   = evalSrho(p_rho,p_rho_c,p_rho_theta,K_rho_c,K_rho_rho,d_rho,
+                                  rho_h,c_h,H_h);
+        double S_c     = evalSc(p_c_rho,p_c_thetaE,K_c_c,d_c,p_c_alpha,
+                                rho_h,c_h,alpha_healthy,H_h);
+        double S_alpha = evalSalpha(d_alpha,alpha_healthy);
+        double S_phi   = evalPhidot(p_phi,p_phi_c,p_phi_theta,K_phi_c,K_phi_rho,
+                                    d_phi,d_phi_rho_c,rho_h,c_h,phi_h,H_h);
+        std::cout<<"\n  Fixed-point residuals at (alpha,rho,c,phi)=(0,1,1,1), H=1/2:\n";
+        std::cout<<"    s_rho   = "<<S_rho<<"\n    s_c     = "<<S_c
+                 <<"\n    s_alpha = "<<S_alpha
+                 <<"\n    s_phi   = "<<S_phi<<"\n";
         const double worst = std::max(std::max(std::fabs(S_rho),std::fabs(S_c)),
-                                      std::fabs(S_phi));
+                                      std::max(std::fabs(S_alpha),std::fabs(S_phi)));
         if(worst > 1e-12)
             std::cout<<"  *** WARNING: homeostasis not exact (worst "<<worst<<") ***\n";
         else
