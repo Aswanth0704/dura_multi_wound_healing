@@ -1266,7 +1266,8 @@ void writeParaview(tissue &myTissue, const char* filename, const char* filename2
                 node_ip_count[myTissue.vol_elem_connectivity[elemi][ip]] += 1;
             }
             else if(elem_size == 4){
-                // There is only one IP, so just average the element
+                // Average all IPs of the element onto each of its nodes
+                // (node_ip_count is incremented to match).
                 for(int nodei=0;nodei<elem_size;nodei++){
                     node_phi[myTissue.vol_elem_connectivity[elemi][nodei]]+=myTissue.ip_phif[elemi*IP_size+ip];
                     node_a0[myTissue.vol_elem_connectivity[elemi][nodei]]+=myTissue.ip_a0[elemi*IP_size+ip];

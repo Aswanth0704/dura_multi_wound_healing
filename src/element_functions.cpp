@@ -305,9 +305,28 @@ std::vector<Vector4d> LineQuadriIPQuadratic()
 
 std::vector<Vector4d> LineQuadriIPTet()
 {
-    // return the integration points of the hex element
+    // Integration points for the LINEAR tetrahedron.
+    //
+    // This used to be a single centroid point, weight 1/6. That is adequate for
+    // the (constant) gradient terms but NOT for the mass/reaction terms: at the
+    // centroid all four shape functions equal 1/4, so the element matrix
+    // R_i R_j is (1/16)*ones(4,4), i.e. RANK 1. The transport operator then
+    // carries three near-null modes per element. With uniform concentrations
+    // nothing excites them, but a sharp wound gradient does, and the Newton
+    // increment blows up inside those modes - concentration increments of ~100
+    // were observed on a field whose physiological value is 1, while the
+    // residual stayed small.
+    //
+    // The 4-point Keast rule below is degree 2, so it integrates the linear-tet
+    // mass matrix exactly and gives a full-rank element operator. Weights sum to
+    // the reference tetrahedron volume 1/6, matching the convention used here.
     std::vector<Vector4d> IP;
-    IP.push_back(Vector4d(1./4,1./4,1./4,1./6));
+    std::vector<double> pIP = {(5.-sqrt(5))/20., (5.+3.*sqrt(5))/20.};
+    double wIP = 1./24;
+    IP.push_back(Vector4d(pIP[0],pIP[0],pIP[0],wIP));
+    IP.push_back(Vector4d(pIP[0],pIP[0],pIP[1],wIP));
+    IP.push_back(Vector4d(pIP[0],pIP[1],pIP[0],wIP));
+    IP.push_back(Vector4d(pIP[1],pIP[0],pIP[0],wIP));
     return IP;
 }
 

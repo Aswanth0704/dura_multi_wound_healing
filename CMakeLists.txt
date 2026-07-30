@@ -129,4 +129,9 @@ enable_testing()
 add_executable(test_mechanosensing EXCLUDE_FROM_ALL tests/test_mechanosensing.cpp)
 target_compile_features(test_mechanosensing PRIVATE cxx_std_17)
 add_test(NAME mechanosensing COMMAND test_mechanosensing)
-add_custom_target(tests DEPENDS test_mechanosensing)
+
+add_executable(test_diffusivity EXCLUDE_FROM_ALL tests/test_diffusivity.cpp)
+target_compile_features(test_diffusivity PRIVATE cxx_std_17)
+add_test(NAME diffusivity COMMAND test_diffusivity)
+
+add_custom_target(tests DEPENDS test_mechanosensing test_diffusivity)

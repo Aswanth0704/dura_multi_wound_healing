@@ -12,6 +12,7 @@ This code is the implementation of the DaLaWoHe
 #include "local_solver.h"
 #include "element_functions.h"
 #include "mechanosensing.h"
+#include "diffusivity.h"
 #include <iostream>
 #include <cmath>
 #include <map>
@@ -20,40 +21,6 @@ This code is the implementation of the DaLaWoHe
 #include <fstream>
 
 using namespace Eigen;
-
-//--------------------------------------------------------//
-// FIBROBLAST DIFFUSIVITY  D_rho(phif)
-//--------------------------------------------------------//
-//
-// Single definition, used by evalWound, evalFluxesSources, evalQ and evalBC.
-// NOTE: global_parameters[7] is the legacy D_rhorho slot and is NOT read -
-// the diffusivity is defined entirely here.
-//
-//   Ppoly(x) = A x^5 + B x^4 + C x^3 + D x^2 + E x       (Ppoly(0)=Ppoly(1)=0)
-//   C_up     = 1 - 1/(1+exp(-500 (phi-1)))   upper shutoff at healthy collagen
-//   D_rho    = KD * (1e-3 Ppoly(phi - phif00))^2 / 6 * C_up
-//
-// The polynomial is evaluated at (phi - phif00), so it also vanishes at
-// phi = phif00, which is how the low-collagen cutoff is presently achieved.
-//
-static inline double evalDrho(double phif, double c)
-{
-    (void)c; // no chemotactic dependence in this form
-
-    const double KD  =  1582.3;
-    const double A   =   182.01;
-    const double B   =  -655.0;
-    const double C   =   875.66;
-    const double D   =  -521.57;
-    const double E   =   118.9;
-    const double phif00 = 1e-2;
-
-    const double x     = phif - phif00;
-    const double Ppoly = A*pow(x,5) + B*pow(x,4) + C*pow(x,3) + D*pow(x,2) + E*x;
-    const double C_up  = 1.0 - (1.0/(1.0 + exp(-500.0*(phif - 1.0))));
-
-    return KD*(pow(Ppoly*0.001, 2)/6.0)*C_up;
-}
 
 //--------------------------------------------------------//
 // RESIDUAL AND TANGENT
@@ -1180,25 +1147,36 @@ void evalWound(
                 // Ke_rho_rho
                 //-----------//
 
-                Ke_rho_rho(nodei,nodej) += Jac*(R[nodei]*R[nodej]/dt -1.* R[nodei]*dS_rhodrho*R[nodej] -1.* Grad_R[nodei].dot(linQ_rhodGradrho*Grad_R[nodej] + linQ_rhodrho*R[nodej]))*wip;
+                // The flux terms carry a chain rule through the structural
+                // update that used to be dropped: D_rho depends on phif, and
+                // phif depends on rho and c via the local solver, so
+                //   dQ_rho/drho_j += (dQ_rho/dphif)(dphif/drho) R_j
+                // The source terms were already fully chain-ruled (see
+                // dS_rhodrho above); the fluxes were chain-ruled only through
+                // CC, i.e. D was frozen with respect to rho and c. That was
+                // survivable with a mild D(phi) but not with the tanh gate in
+                // evalDrho(), whose slope reaches ~150 at phi = 0.01.
+                Ke_rho_rho(nodei,nodej) += Jac*(R[nodei]*R[nodej]/dt -1.* R[nodei]*dS_rhodrho*R[nodej] -1.* Grad_R[nodei].dot(linQ_rhodGradrho*Grad_R[nodej] + linQ_rhodrho*R[nodej] + dQ_rhodphif*dphifdrho*R[nodej]))*wip;
 
                 //-----------//
                 // Ke_rho_c
                 //-----------//
 
-                Ke_rho_c(nodei,nodej) += Jac*(-1.*R[nodei]*dS_rhodc*R[nodej] -1.* Grad_R[nodei].dot(linQ_rhodGradc*Grad_R[nodej]))*wip;
+                Ke_rho_c(nodei,nodej) += Jac*(-1.*R[nodei]*dS_rhodc*R[nodej] -1.* Grad_R[nodei].dot(linQ_rhodGradc*Grad_R[nodej] + dQ_rhodphif*dphifdc*R[nodej]))*wip;
 
                 //-----------//
                 // Ke_c_rho
                 //-----------//
-
-                Ke_c_rho(nodei,nodej) += Jac*(-1.*R[nodei]*dS_cdrho*R[nodej])*wip;
+                // dQ_cdphif is identically zero while D_cc is constant, but
+                // keep the term so the tangent stays consistent if D_c ever
+                // becomes collagen-dependent.
+                Ke_c_rho(nodei,nodej) += Jac*(-1.*R[nodei]*dS_cdrho*R[nodej] -1.* Grad_R[nodei].dot(dQ_cdphif*dphifdrho*R[nodej]))*wip;
 
                 //-----------//
                 // Ke_c_c
                 //-----------//
 
-                Ke_c_c(nodei,nodej) += Jac*(R[nodei]*R[nodej]/dt -1.* R[nodei]*dS_cdc*R[nodej] -1.* Grad_R[nodei].dot(linQ_cdGradc*Grad_R[nodej]))*wip;
+                Ke_c_c(nodei,nodej) += Jac*(R[nodei]*R[nodej]/dt -1.* R[nodei]*dS_cdc*R[nodej] -1.* Grad_R[nodei].dot(linQ_cdGradc*Grad_R[nodej] + dQ_cdphif*dphifdc*R[nodej]))*wip;
             }
         }
     } // END INTEGRATION loop
@@ -1310,7 +1288,14 @@ void evalFluxesSources(const std::vector<double> &global_parameters, const doubl
     //------------------//
     // Second Piola Kirchhoff stress tensor
     // passive elastic
-    double Psif = (kf/(2.*k2))*(exp( k2*pow((kappa*I1e + (1-3*kappa)*I4e -1),2))-1);
+    // NOTE: no "-1" here. Psif is not the strain energy itself but the factor
+    // (kf/2k2) exp(k2 E^2) whose product with 2 k2 kappa E reproduces
+    // dPsi/dI1e = kf kappa E exp(k2 E^2) in Psif1/Psif4 below. Subtracting 1
+    // (as this line used to) makes those derivatives inconsistent with the
+    // analytic stress in evalWound, which corrupts every finite-difference
+    // structural sensitivity computed from this routine and degrades the
+    // Newton convergence rate.
+    double Psif = (kf/(2.*k2))*(exp( k2*pow((kappa*I1e + (1-3*kappa)*I4e -1),2)));
     double Psif1 = 2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
     double Psif4 = 2*k2*(1-3*kappa)*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
     //Matrix3d SSe_pas = k0*Identity + phif*(Psif1*Identity + Psif4*a0a0);

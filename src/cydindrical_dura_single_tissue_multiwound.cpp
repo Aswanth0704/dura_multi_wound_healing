@@ -367,10 +367,26 @@ int main(int argc, char *argv[])
     double time_step_ratio = 100;   // local substeps per global step
     double max_iter = 100;          // inert in the explicit local solver
 
+    // Deadband for plastic growth: no remodelling while the elastic stretch is
+    // inside [lamdaE_lo, lamdaE_hi]. This MUST contain the homeostatic elastic
+    // stretches, which for the prestretched dura are
+    //   (lam_z, lam_th, lam_r) = (1.098, 1.035, 0.880).
+    // The old hard-coded 0.95/1.05 excluded both the axial and the
+    // through-thickness value, so healthy tissue remodelled continuously and
+    // slowly relaxed its own prestretch.
+    double lamdaE_lo = 0.85;
+    double lamdaE_hi = 1.15;
+    {
+        const double lam_r_h = 1.0/(1.098*1.035);
+        if(lamdaE_lo > lam_r_h || lamdaE_hi < 1.098)
+            throw std::runtime_error("plastic-growth deadband excludes the "
+                "physiological prestretch: healthy tissue would remodel.");
+    }
+
     std::vector<double> local_parameters = {p_phi,p_phi_c,p_phi_theta,K_phi_c,
         K_phi_rho,d_phi,d_phi_rho_c,tau_omega,tau_kappa,gamma_kappa,
         tau_lamdaP_a,tau_lamdaP_s,tau_lamdaP_n,vartheta_e,gamma_theta,
-        tol_local,time_step_ratio,max_iter};
+        tol_local,time_step_ratio,max_iter,lamdaE_lo,lamdaE_hi};
 
     //---------------------------------//
     // Echo the parameter set and check the fixed point numerically.
@@ -386,7 +402,7 @@ int main(int argc, char *argv[])
     const char* lnames[] = {"p_phi","p_phi_c","p_phi_theta","K_phi_c","K_phi_rho*",
         "d_phi","d_phi_rho_c","tau_omega*","tau_kappa*","gamma_kappa",
         "tau_lamdaP_a","tau_lamdaP_s","tau_lamdaP_n","vartheta_e","gamma_theta",
-        "tol_local","time_step_ratio","max_iter"};
+        "tol_local","time_step_ratio","max_iter","lamdaE_lo","lamdaE_hi"};
     for(size_t i=0;i<local_parameters.size();i++)
         std::cout<<"  local ["<<std::setw(2)<<i<<"] "<<std::setw(18)<<lnames[i]
                  <<" = "<<local_parameters[i]<<"\n";

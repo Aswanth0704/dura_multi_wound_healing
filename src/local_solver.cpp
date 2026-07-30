@@ -140,8 +140,18 @@ void localWoundProblemExplicit(
     VectorXd dThetadrho_num(8); dThetadrho_num.setZero();
     VectorXd dThetadc_num(8); dThetadc_num.setZero();
     
-    double lowlim= 0.95; // what are these
-    double uplim= 1.05;  // what are these
+    // Deadband for permanent (plastic) growth: no remodelling while the elastic
+    // stretch stays inside [lowlim, uplim].
+    //
+    // These used to be 0.95 / 1.05, which is INCOMPATIBLE with the physiological
+    // prestretch. Healthy dura sits at lamdaE = (1.098, 1.035, 0.880), so the
+    // axial and through-thickness stretches both fall outside [0.95, 1.05] and
+    // plastic growth fires continuously in perfectly healthy tissue, slowly
+    // eating the prestretch (theta_e drifts down and H away from 1/2). The band
+    // must contain the homeostatic elastic stretches, so it is now supplied by
+    // the driver via local_parameters[18]/[19] instead of being hard-coded.
+    double lowlim = (local_parameters.size() > 18) ? local_parameters[18] : 0.85;
+    double uplim  = (local_parameters.size() > 19) ? local_parameters[19] : 1.15;
 
     //std::ofstream myfile;
     //myfile.open("FE_results.csv");

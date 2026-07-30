@@ -19,6 +19,8 @@
 #include <Eigen/Core>
 #include <Eigen/Sparse> // functions for solution of linear systems
 #include <Eigen/OrderingMethods>
+#include <Eigen/IterativeLinearSolvers>
+#include <Eigen/SparseLU>
 typedef Eigen::SparseMatrix<double> SpMat; // declares a column-major sparse matrix type of double
 typedef Eigen::Triplet<double> T;
 
@@ -291,9 +293,19 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
     //SparseMatrix<double> KK2(n_dof,n_dof);
     //SparseMatrix<double,ColMajor> KK2(n_dof,n_dof); // ColMajor for SparseLU
 
-    BiCGSTAB<SparseMatrix<double, RowMajor> > BICGsolver; // Try with or without preconditioner , Eigen::IncompleteLUT<double>
-    //PardisoLU<SparseMatrix<double>> pardisoLUsolver;
-    //SparseLU<SparseMatrix<double, ColMajor>, COLAMDOrdering<int> > SparseLUsolver;
+    // Seeding a wound drops phif from 1 to 0.01, and the passive stress scales
+    // with phif, so the tangent picks up a ~100x stiffness contrast on top of
+    // the mechanics/transport block scaling. Unpreconditioned BiCGSTAB
+    // stagnates on that and reports NoConvergence. An incomplete-LU
+    // preconditioner handles it; a direct SparseLU is kept as a fallback for
+    // the rare step where the iterative solve still fails, which is much
+    // cheaper than the alternative of repeatedly halving the time step.
+    BiCGSTAB<SparseMatrix<double, RowMajor>, IncompleteLUT<double> > BICGsolver;
+    BICGsolver.preconditioner().setDroptol(1e-5);
+    BICGsolver.preconditioner().setFillfactor(20);
+    BICGsolver.setMaxIterations(2000);
+    BICGsolver.setTolerance(1e-10);
+    SparseLU<SparseMatrix<double, ColMajor>, COLAMDOrdering<int> > SparseLUsolver;
 
 	//std::cout<<"start parameters\n";
 	// PARAMETERS FOR THE SIMULATION
@@ -322,6 +334,13 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
     int iter;
 	for(int step=0;step<total_steps;step++)
 	{
+		// Snapshot the deformed geometry for this step. The rollback below
+		// restores node_rho, node_c and every IP variable from their _0 copies,
+		// but node_x has no _0 counterpart and used to be left at the diverged
+		// value - so each retry restarted from garbage and the adaptive time
+		// step could never recover.
+		std::vector<Vector3d> node_x_step = myTissue.node_x;
+
 		// GLOBAL NEWTON-RAPHSON ITERATION
 		iter = 0;
 		double residuum  = 1.;
@@ -739,6 +758,36 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             }
             // FINISH LOOP OVER SURFACE ELEMENTS
             */
+            // Guard against NaN/Inf entering the linear solve. Without this the
+            // iterative solver just reports NoConvergence with a NaN error and
+            // the cause is invisible.
+            {
+                int bad_dof = -1;
+                for(int i=0;i<n_dof;i++){
+                    if(!std::isfinite(RR(i))){ bad_dof = i; break; }
+                }
+                long bad_k = 0;
+                for(size_t t=0;t<KK_triplets.size();t++)
+                    if(!std::isfinite(KK_triplets[t].value())) bad_k++;
+                if(bad_dof >= 0 || bad_k > 0){
+                    std::cout<<"*** NON-FINITE SYSTEM at step "<<step<<" iter "<<iter<<": ";
+                    if(bad_dof >= 0){
+                        std::vector<int> m = myTissue.dof_inv_map[bad_dof];
+                        const char* fld = (m[0]==0)?"x":((m[0]==1)?"rho":((m[0]==2)?"c":"alpha"));
+                        int nodei = (m[0]==0) ? m[1]/n_coord : m[1];
+                        std::cout<<"RR("<<bad_dof<<") field="<<fld<<" node="<<nodei
+                                 <<" X=("<<myTissue.node_X[nodei](0)<<","
+                                 <<myTissue.node_X[nodei](1)<<","
+                                 <<myTissue.node_X[nodei](2)<<")"
+                                 <<" rho="<<myTissue.node_rho[nodei]
+                                 <<" c="<<myTissue.node_c[nodei]<<"; ";
+                    }
+                    std::cout<<bad_k<<" non-finite tangent entries\n";
+                    reset = true;
+                    break;
+                }
+            }
+
             // residual norm
 			double normRR = sqrt(RR.dot(RR));
 			if(iter==0){
@@ -758,23 +807,107 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 			KK2.makeCompressed();
 			//std::cout<<"KK2\n"<<KK2<<"\n";
 
-			// Compute the numerical factorization
-            BICGsolver.compute(KK2);
-			if(BICGsolver.info()!=Eigen::Success) {
-                std::cout << "Factorization failed" << "\n";
-                reset = true;
-                break;
+            // ---------------- LINEAR SOLVE ----------------
+            //
+            // The monolithic system is badly SCALED, not merely stiff: the
+            // mechanics block carries entries of order kf ~ 40 MPa (and the
+            // fiber tangent pushes that to several hundred) while the transport
+            // blocks are of order 1/dt ~ 5. Unpreconditioned BiCGSTAB reported
+            // errors as large as 1e+74 on this, which surfaced as concentration
+            // increments of ~200 in a field whose physiological value is 1.
+            //
+            // Symmetric diagonal equilibration fixes the scaling: solve
+            //     (S K S) y = S b,    SOL = S y,    S = diag(1/sqrt(|K_ii|))
+            // which puts unit magnitude on the diagonal and makes the blocks
+            // comparable. A direct factorization is then used as the primary
+            // solver - at this problem size it is affordable and, unlike the
+            // iterative path, it does not silently return a garbage increment.
+            VectorXd Sscale(n_dof);
+            for(int i=0;i<n_dof;i++){
+                const double d = std::abs(KK2.coeff(i,i));
+                Sscale(i) = (d > 1e-300) ? 1.0/std::sqrt(d) : 1.0;
             }
+            {
+                // Apply S K S in place on the triplets, then rebuild.
+                for(size_t t=0;t<KK_triplets.size();t++){
+                    const int r = KK_triplets[t].row();
+                    const int cc = KK_triplets[t].col();
+                    KK_triplets[t] = T(r, cc, KK_triplets[t].value()*Sscale(r)*Sscale(cc));
+                }
+                KK2.setZero();
+                KK2.setFromTriplets(KK_triplets.begin(), KK_triplets.end());
+                KK2.makeCompressed();
+            }
+            VectorXd rhs_scaled(n_dof);
+            for(int i=0;i<n_dof;i++) rhs_scaled(i) = -RR(i)*Sscale(i);
 
-            // SOLVE: Use the factors to solve the linear system
-            SOL = BICGsolver.solve(-1.*RR);
-            //std::cout << "#iterations:     " << solver.iterations() << std::endl;
-            //std::cout << "estimated error: " << solver.error()      << std::endl;
-            //std::cout<<SOL<<"\n";
-            if(BICGsolver.info()!=Eigen::Success) {
+            bool solved = false;
+            {
+                SparseMatrix<double, ColMajor> KKcol = KK2;
+                KKcol.makeCompressed();
+                SparseLUsolver.analyzePattern(KKcol);
+                SparseLUsolver.factorize(KKcol);
+                if(SparseLUsolver.info()==Eigen::Success){
+                    VectorXd y = SparseLUsolver.solve(rhs_scaled);
+                    if(SparseLUsolver.info()==Eigen::Success){
+                        for(int i=0;i<n_dof;i++) SOL(i) = y(i)*Sscale(i);
+                        solved = true;
+                    }
+                }
+            }
+            if(!solved){
+                // Direct factorization failed (genuinely singular tangent).
+                // Try the equilibrated iterative solver before giving up.
+                BICGsolver.compute(KK2);
+                if(BICGsolver.info()==Eigen::Success){
+                    VectorXd y = BICGsolver.solve(rhs_scaled);
+                    if(BICGsolver.info()==Eigen::Success){
+                        for(int i=0;i<n_dof;i++) SOL(i) = y(i)*Sscale(i);
+                        solved = true;
+                    }
+                }
+            }
+            if(!solved){
                 std::cout << "Solver failed, no convergence" << "\n";
                 reset = true;
                 break;
+            }
+            for(int i=0;i<n_dof;i++){
+                if(!std::isfinite(SOL(i))){
+                    std::cout << "Solver returned a non-finite increment" << "\n";
+                    reset = true; solved = false; break;
+                }
+            }
+            if(!solved) break;
+
+            // DAMPED NEWTON / STEP LIMITING
+            //
+            // Seeding a wound collapses the passive stress in the wound elements
+            // (SSe_pas scales with phif, which drops from 1 to 0.01), so the
+            // punctured prestretched shell snaps open. That is a violently
+            // nonlinear event and an undamped Newton step overshoots badly:
+            // increments were observed running 5.6 -> 25 -> 118 before the
+            // tangent went non-finite. Scaling the whole increment preserves the
+            // Newton direction and just limits how far we travel per iteration.
+            {
+                double max_dx = 0.0, max_dfield = 0.0;
+                for(int dofi=0;dofi<n_dof;dofi++){
+                    const std::vector<int>& m = myTissue.dof_inv_map[dofi];
+                    const double a = std::abs(SOL(dofi));
+                    if(m[0]==0) max_dx     = std::max(max_dx, a);
+                    else        max_dfield = std::max(max_dfield, a);
+                }
+                // limits per Newton iteration
+                const double dx_cap    = 0.05;  // [mm]
+                const double dfld_cap  = 0.25;  // normalized concentration
+                double scale = 1.0;
+                if(max_dx     > dx_cap)   scale = std::min(scale, dx_cap/max_dx);
+                if(max_dfield > dfld_cap) scale = std::min(scale, dfld_cap/max_dfield);
+                if(scale < 1.0){
+                    SOL *= scale;
+                    std::cout<<"  damping Newton step by "<<scale
+                             <<" (max dx "<<max_dx<<", max dfield "<<max_dfield<<")\n";
+                }
             }
 
 			// update the solution
@@ -846,7 +979,9 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             step = step*slowdown;
             total_steps = total_steps*slowdown;
 
-            // reset nodal variables
+            // reset nodal variables (including the geometry - see the snapshot
+            // taken at the top of this time step)
+            myTissue.node_x = node_x_step;
             for(int nodei=0;nodei<myTissue.n_node;nodei++)
             {
                 myTissue.node_rho[nodei] = myTissue.node_rho_0[nodei];
@@ -988,9 +1123,19 @@ void sparseLoadSolver(tissue &myTissue, const std::string& filename, int save_fr
     //SparseMatrix<double> KK2(n_dof,n_dof);
     //SparseMatrix<double,ColMajor> KK2(n_dof,n_dof); // ColMajor for SparseLU
 
-    BiCGSTAB<SparseMatrix<double, RowMajor> > BICGsolver; // Try with or without preconditioner , Eigen::IncompleteLUT<double>
-    //PardisoLU<SparseMatrix<double>> pardisoLUsolver;
-    //SparseLU<SparseMatrix<double, ColMajor>, COLAMDOrdering<int> > SparseLUsolver;
+    // Seeding a wound drops phif from 1 to 0.01, and the passive stress scales
+    // with phif, so the tangent picks up a ~100x stiffness contrast on top of
+    // the mechanics/transport block scaling. Unpreconditioned BiCGSTAB
+    // stagnates on that and reports NoConvergence. An incomplete-LU
+    // preconditioner handles it; a direct SparseLU is kept as a fallback for
+    // the rare step where the iterative solve still fails, which is much
+    // cheaper than the alternative of repeatedly halving the time step.
+    BiCGSTAB<SparseMatrix<double, RowMajor>, IncompleteLUT<double> > BICGsolver;
+    BICGsolver.preconditioner().setDroptol(1e-5);
+    BICGsolver.preconditioner().setFillfactor(20);
+    BICGsolver.setMaxIterations(2000);
+    BICGsolver.setTolerance(1e-10);
+    SparseLU<SparseMatrix<double, ColMajor>, COLAMDOrdering<int> > SparseLUsolver;
 
     //std::cout<<"start parameters\n";
     // PARAMETERS FOR THE SIMULATION
