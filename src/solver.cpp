@@ -1077,6 +1077,30 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
         }
 
         // ADVANCE IN TIME
+        // POSITIVITY REPORT
+        //
+        // The transport discretization does not guarantee positivity, and there
+        // is deliberately no clamping: clamping would hide a convergence
+        // problem rather than fix one. Report instead, so a negative species
+        // can never pass unnoticed. Rejecting unconverged steps removes the
+        // usual cause; anything surviving that is a genuine discretization
+        // artefact worth seeing.
+        {
+            int n_neg = 0; double worst = 0.0; const char* which = "";
+            const bool has_a = !myTissue.node_alpha.empty();
+            for(int i=0;i<myTissue.n_node;i++){
+                const double r = myTissue.node_rho[i];
+                const double cc = myTissue.node_c[i];
+                const double aa = has_a ? myTissue.node_alpha[i] : 0.0;
+                if(r  < worst){ worst = r;  which = "rho"; }
+                if(cc < worst){ worst = cc; which = "c"; }
+                if(aa < worst){ worst = aa; which = "alpha"; }
+                if(r < 0.0 || cc < 0.0 || aa < 0.0) n_neg++;
+            }
+            if(n_neg > 0)
+                std::cout<<"  NEGATIVE SPECIES at step "<<step<<": "<<n_neg
+                         <<" node(s), worst "<<which<<" = "<<worst<<"\n";
+        }
 
         // Increment in time before ending adaptive step
         time += time_step;
