@@ -31,6 +31,8 @@
     WOUND_ALPHA_D     D_alpha   [mm^2/h]  (0 decouples alpha spatially)
     WOUND_ALPHA_DECAY d_alpha   [1/h]
     WOUND_ALPHA_PC    p_c_alpha [1/h]     (0 decouples alpha from cytokine)
+    WOUND_TRAMP     duration of the small-dt puncture transient [h] (0 disables)
+    WOUND_DTRAMP    time step during that transient [h]
 */
 
 #include <omp.h>
@@ -44,6 +46,7 @@
 #include "homeostasis.h"
 #include <iostream>
 #include <iomanip>
+#include <algorithm>
 #include <fstream>
 #include <cmath>
 #include <cstdlib>
@@ -805,10 +808,44 @@ int main(int argc, char *argv[])
     }
 
     double t_heal = env_dbl("WOUND_TFINAL", (7*24*4)+1);
+
+    //-------------------------------------------------------------------//
+    // PHASE 2a: absorb the puncture transient with a small time step.
+    //
+    // Seeding the wound collapses the passive stress in those elements
+    // (SSe_pas scales with phif, 1 -> 0.01), so the prestretched shell snaps
+    // open. The physically required change in rho, c and phi over one 0.2 h
+    // step is tiny - diffusion moves rho by ~5e-3 - but the concentration
+    // block is only diagonally weighted by 1/dt = 5, and with the mechanics
+    // simultaneously travelling a long way the Newton direction becomes
+    // unreliable: the residual was observed jumping from 0.17 to 10.5 with a
+    // requested concentration increment of ~190.
+    //
+    // Running the first fraction of an hour at dt_ramp makes 1/dt ~100x
+    // larger, so the transport diagonal dominates and the transient is
+    // resolved rather than fought. The cost is a few hundred cheap steps.
+    //-------------------------------------------------------------------//
+    const double dt_normal = myTissue.time_step;
+    const double t_ramp    = env_dbl("WOUND_TRAMP",  0.4);
+    const double dt_ramp   = env_dbl("WOUND_DTRAMP", 0.002);
+    if(t_ramp > 0.0 && dt_ramp > 0.0 && dt_ramp < dt_normal){
+        myTissue.time = 0.0;
+        myTissue.time_final = t_ramp;
+        myTissue.time_step  = dt_ramp;
+        int sf = (int)std::max(1.0, (t_ramp/dt_ramp)/4.0);
+        std::string fr = out_prefix + "_ramp_";
+        std::cout<<"\n#### PHASE 2a: puncture transient, "<<t_ramp
+                 <<" h at dt = "<<dt_ramp<<" ####\n";
+        sparseWoundSolver(myTissue, fr, sf, save_node, save_ip);
+        reportState(myTissue, IP, "after the puncture transient");
+        myTissue.time_step = dt_normal;
+    }
+
     myTissue.time = 0.0;
-    myTissue.time_final = t_heal;
+    myTissue.time_final = std::max(0.0, t_heal - t_ramp);
     std::string f = out_prefix + "_heal_";
-    std::cout<<"\n#### PHASE 2: healing for "<<t_heal<<" h ####\n";
+    std::cout<<"\n#### PHASE 2b: healing for "<<myTissue.time_final
+             <<" h at dt = "<<dt_normal<<" ####\n";
     sparseWoundSolver(myTissue, f, 5, save_node, save_ip);
     reportState(myTissue, IP, "after healing");
 
