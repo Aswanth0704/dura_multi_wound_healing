@@ -106,6 +106,13 @@ struct tissue{
 	double time_step;
 	double time;
 	double tol;
+	// Second convergence test, on the Newton increment. The residual test
+	// alone cannot detect a limit cycle: at the plastic-growth deadband kink
+	// the residual is C0 but not C1, and Newton bounces between two states,
+	// repeating the same residual and the same increment bit-for-bit for
+	// hundreds of iterations. When the increment has collapsed the state has
+	// stopped moving and the step is converged in every practical sense.
+	double tol_inc;
 	int max_iter;
 	
 };

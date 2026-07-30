@@ -35,6 +35,7 @@
     WOUND_RUNGS     steps per rung of that ladder (0 disables the ladder)
     WOUND_WSMOOTH   width of the smooth wound edge [mm]
     WOUND_TOL       Newton tolerance on the relative residual
+    WOUND_TOL_INC   Newton tolerance on the increment norm (limit-cycle escape)
 */
 
 #include <omp.h>
@@ -479,7 +480,7 @@ int main(int argc, char *argv[])
     std::vector<int> meshResolution =  {16,16,6};
 
     std::string mesh_filename = env_str("WOUND_MESH",
-                                        "dura_cyl_repeated_wound_v62_20t_finer.mphtxt");
+                                        "dura_cyl_repeated_wound_v62_2t_finer.mphtxt");
     std::cout<<"mesh file: "<<mesh_filename<<"\n";
     HexMesh myMesh = readCOMSOLInput(mesh_filename, hexDimensions, meshResolution);
 
@@ -522,8 +523,9 @@ int main(int argc, char *argv[])
     double tol_boundary = 1e-5;
     double y_center = 0.0;
     double z_center = 0.5*(Zmin + Zmax);
-    const double Xmin_wound = Xmin - tol_boundary;
-    const double Xmax_wound = -r_cord + 0.01;
+    // NOTE: the deformed-frame versions of these bounds are defined just after
+    // the prestretch constants below, because seeding runs on node_x (deformed)
+    // and reference-frame limits do not describe the settled geometry.
 
     //=======================================================================//
     // PRESTRETCH
@@ -534,6 +536,38 @@ int main(int argc, char *argv[])
     std::cout<<"prestretch: lam_axial="<<lam_z<<" lam_circ="<<lam_th
              <<" lam_thick="<<1.0/(lam_z*lam_th)
              <<"  -> theta_e="<<lam_z*lam_th<<"\n";
+
+    // Wound bounds in the DEFORMED frame.
+    //
+    // The wound is seeded after settling and its membership test runs on
+    // myTissue.node_x - deliberately, because the puncture is made in vivo.
+    // The bounds must therefore live in the same frame. Using the reference
+    // limits here (as this used to) produced three coupled errors, all
+    // measured from w_WOUNDCHECK.vtk:
+    //
+    //   1. z_center = 5.0 is the REFERENCE mid-length, but the settled mesh
+    //      spans z in [0, 10.98], so its mid-length is 5.49. Testing deformed
+    //      z against 5.0 put the wound at reference z = 4.554 - off the
+    //      refined patch this mesh carries at z = 5.0 (549 nodes within
+    //      +-0.25 mm instead of 1536).
+    //   2. Xmin_wound = -(r_cord+t_dura) = -5.4 is the REFERENCE outer radius,
+    //      while the settled outer surface sits at -5.55799. Every node beyond
+    //      r = 5.4 failed the test, so the needle track pierced only the inner
+    //      55% of the wall - a partial-thickness lesion, not a puncture.
+    //   3. The free patch below tests myMesh.nodes (reference) against the same
+    //      z_center, so patch and wound ended up 0.45 mm apart and the
+    //      contraction boundary was asymmetric about the track.
+    //
+    // Mapping the reference limits through the same prestretch fixes all three.
+    const double lam_r_pre  = 1.0/(lam_z*lam_th);
+    const double r_in_def   = r_mid*lam_th + (r_cord          - r_mid)*lam_r_pre;
+    const double r_out_def  = r_mid*lam_th + (r_cord + t_dura - r_mid)*lam_r_pre;
+    const double z_center_def = z_center*lam_z;
+    const double Xmin_wound = -r_out_def - tol_boundary;
+    const double Xmax_wound = -r_in_def  + 0.01;
+    std::cout<<"wound bounds (deformed frame): x in ["<<Xmin_wound<<", "
+             <<Xmax_wound<<"], z_center "<<z_center_def
+             <<" (reference "<<z_center<<")\n";
 
     // Identify the outer boundary: the two end rings (already flagged by
     // readCOMSOLInput via z) plus the inner and outer lateral surfaces, which
@@ -662,6 +696,12 @@ int main(int argc, char *argv[])
     // 100 h no-wound gate at this tolerance and comparing against the completed
     // 1e-8 run; see ToDo.md.
     myTissue.tol        = env_dbl("WOUND_TOL", 1e-6);
+    // Second convergence test, on the Newton increment, so a limit cycle at the
+    // plastic-growth deadband kink does not stall the run. Default 1e-4 is the
+    // L2 norm of the whole increment vector over every dof: at the observed
+    // stall it is 9.3e-6 (a per-dof RMS of ~5e-8 on fields of order 1), while a
+    // genuinely diverged step carries ~1e2. Four orders of headroom either way.
+    myTissue.tol_inc    = env_dbl("WOUND_TOL_INC", 1e-4);
     // Newton converges LINEARLY (not quadratically) on the stiff
     // alpha-driven cytokine surge, reaching ~1e-6 by iteration 60. Rejecting
     // there costs a 5x dt cut; giving it more iterations is much cheaper, so
@@ -739,10 +779,14 @@ int main(int argc, char *argv[])
         for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
             if(!on_boundary[nodei]) continue;
             // Distance from the needle track, measured in the plane normal to
-            // the track axis (which runs along x).
-            const Vector3d& X = myMesh.nodes[nodei];
+            // the track axis (which runs along x). Measured on the SETTLED
+            // geometry against the same deformed-frame centre the wound
+            // seeding uses, so the patch is concentric with the puncture -
+            // testing reference coordinates here while seeding on deformed
+            // ones left the two 0.45 mm apart.
+            const Vector3d& X = myTissue.node_x[nodei];
             const double d2 = (X(1)-y_center)*(X(1)-y_center)
-                            + (X(2)-z_center)*(X(2)-z_center);
+                            + (X(2)-z_center_def)*(X(2)-z_center_def);
             const bool near_wound = (d2 < patch_radius*patch_radius) && (X(0) < 0.0);
             if(near_wound){ n_freed++; continue; }
             eBC_x2.insert(std::pair<int,double>(nodei*3+0, node_target[nodei](0)));
@@ -808,10 +852,11 @@ int main(int argc, char *argv[])
     if(w_smooth < 1.2*mean_edge)
         std::cout<<"  *** WARNING: smoothing width under-resolved; expect "
                    "Galerkin undershoot at the wound edge ***\n";
+    // x is a DEFORMED position, so every bound here is a deformed-frame one.
     auto severity = [&](const Vector3d& x){
         if(x(0) < Xmin_wound || x(0) > Xmax_wound) return 0.0;
         const double r = std::sqrt((x(1)-y_center)*(x(1)-y_center)
-                                 + (x(2)-z_center)*(x(2)-z_center));
+                                 + (x(2)-z_center_def)*(x(2)-z_center_def));
         return 0.5*(1.0 - std::tanh((r - r_wound)/w_smooth));
     };
     auto blend = [](double healthy, double wound, double sev){
@@ -862,8 +907,8 @@ int main(int argc, char *argv[])
         }
     }
     std::cout<<"seeded wound: "<<n_wound_nodes<<" nodes, "<<n_wound_ip
-             <<" integration points  (centre y="<<y_center<<" z="<<z_center
-             <<", radius "<<r_wound<<" mm)\n";
+             <<" integration points  (centre y="<<y_center<<" z="<<z_center_def
+             <<" deformed, radius "<<r_wound<<" mm)\n";
     if(n_wound_nodes == 0 || n_wound_ip == 0)
         std::cout<<"  *** WARNING: wound region is empty - check the mesh and centre ***\n";
 

@@ -1007,6 +1007,33 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 			}
 			iter += 1;
 
+            // SECOND CONVERGENCE TEST: has the state stopped moving?
+            //
+            // The residual test alone cannot see a Newton limit cycle. The
+            // plastic-growth deadband in the local solver switches on a hard
+            // threshold, so lamdaP_dot is continuous but its slope jumps at the
+            // band edge: the residual is C0, not C1. An integration point
+            // sitting on that kink makes Newton chatter across it - observed
+            // repeating residual 9.85137e-06 and increment 9.27092e-06
+            // bit-for-bit from iteration 10 to 200, alternating between two
+            // states. Halving dt does not help, because the cycle is a property
+            // of the state at the kink, not of the step size.
+            //
+            // When the increment has collapsed the step is converged for every
+            // practical purpose, so accept it. The residual guard keeps this
+            // from rescuing a genuinely diverged step: the unconverged steps
+            // that once produced concentrations of -1.66 carried increments of
+            // ~124, seven orders above tol_inc.
+            if(normSOL <= myTissue.tol_inc && residuum <= 1.0e3*myTissue.tol){
+                std::cout<<"\nincrement collapsed to "<<normSOL<<" (<= "
+                         <<myTissue.tol_inc<<") with residual "<<residuum
+                         <<" - state has stopped moving, accepting the step\n";
+                std::cout<<"End of iteration : "<<iter<<",\nResidual before increment: "<<residuum
+                         <<",\nNorm of residual before increment: "<<normRR
+                         <<"\nIncrement norm: "<<normSOL<<"\n\n";
+                break;
+            }
+
             // ADAPTIVE TIME STEP FOR NON-CONVERGED ITERATIONS
 			if(iter == myTissue.max_iter && residuum > myTissue.tol){
 			    // Do NOT accept an unconverged step. Rejecting it here and
