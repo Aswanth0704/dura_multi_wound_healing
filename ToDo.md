@@ -203,6 +203,54 @@ OpenMP, so those "tasks" are already threads, not ranks.
 
 ## Open items
 
+- **The seeded wound never reaches the nominal ICs, and the reported wound
+  values are means — do not read them as the wound core.** Decided to leave as
+  is; recorded here so the analysis does not get redone.
+
+  Three separate effects stack, and only the third is a modelling choice:
+
+  1. `verify_run.py` prints the wound **average**, not the minimum, and the mask
+     is `rho < 0.5` — which spans the fully-wounded axis out to the
+     half-severity radius, so its mean necessarily lands mid-range. At seeding,
+     ρ reads 0.3366 as a mean against a global min of 0.0350.
+  2. The first row of the healing table is **not** t = 0. The series starts
+     after the three dt-ladder stages that absorb the puncture transient
+     (~0.7 h), by which point diffusion has already acted (ρ mean 0.337 at
+     seeding → 0.451 at the first `w_heal` save). Use `w_WOUNDCHECK.vtk` for the
+     true initial condition; it is written before any solve.
+  3. The seed is a tanh, not a step:
+     `sev(r) = ½[1 − tanh((r − r_wound)/w_smooth)]`, and with
+     `w_smooth = 0.1506` mm (1.7 element edges) the ratio `r_wound/w_smooth`
+     is only 1.66, so `tanh` = 0.930 and **peak severity at the axis is 0.9651,
+     not 1**:
+
+     | field | nominal wound IC | actual at the axis |
+     |---|---|---|
+     | ρ, c | 1e-4 | 0.0350 |
+     | φ | 1e-2 | 0.0446 at the IP, 0.0801 at the node |
+     | α | 1 | 0.9651 |
+
+     φ carries an extra step because it is an integration-point variable
+     averaged onto nodes for output, so the VTK shows a smoothed field and its
+     nodal minimum overstates the core value.
+
+  The smoothing is deliberate — a sharp step gave Galerkin oscillations and
+  Newton increments of ~124 — but the cost is that the wound centre keeps 3.5%
+  of healthy ρ instead of 0.01%, and 4.5x the intended residual collagen. The φ
+  one has physical consequence, since `SSe_pas ∝ phif` sets how far the
+  punctured hole snaps open.
+
+  If it ever needs to attain the nominal values, normalise the profile by its
+  own peak — one line, keeps the tanh shoulder that buys the convergence:
+  ```cpp
+  const double sev0 = 0.5*(1.0 - std::tanh(-r_wound/w_smooth));   // 0.9651
+  return 0.5*(1.0 - std::tanh((r - r_wound)/w_smooth)) / sev0;
+  ```
+  Side effect: the half-severity radius moves 0.250 → 0.258 mm, so the wound is
+  ~3% wider. The alternatives are a narrower `w_smooth` (under 1.2 elements the
+  undershoot returns) or a finer mesh at the wound so 1.7 elements is physically
+  smaller — the latter is the right answer for production, at a runtime cost.
+
 - **α retains a small (~1.7%) transient undershoot at the wound front**, while
   ρ, c and φ are now strictly positive. The reason is specific: ρ/c/φ have
   healthy value 1, so a ~2% Galerkin oscillation at the front stays positive,
