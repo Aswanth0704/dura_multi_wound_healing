@@ -1,10 +1,33 @@
 /*
 
-RESULTS for circular wound problem.
+  Cylindrical dura mater, single needle-puncture wound.
 
-Read a mesh defined by myself or imported from another file,
-Then apply boundary conditions.
-Solve.
+  Two-phase driver:
+
+    PHASE 1 - PRESTRETCH / SETTLING (no wound)
+      Living dura sits taut. plan.md's Consolini measurement says excised dura
+      shrinks by 1.098 axially and 1.035 circumferentially, so the mesh is the
+      UNLOADED geometry and the in-vivo state is that mesh stretched. We
+      prescribe that prestretch on every boundary node and let the tissue
+      equilibrate while the biology sits at homeostasis. This is the gate: with
+      theta_e = 1.136 the mechanosensing response is H = 1/2, which is the value
+      every derived parameter assumes, so (rho,c,phi) = (1,1,1) must not drift.
+
+    PHASE 2 - HEALING (wound seeded into the prestretched tissue)
+      The prestretch is held on the boundary EXCEPT inside a free patch around
+      the puncture, so the far field keeps theta_e = 1.136 / H = 1/2 while the
+      wound is free to contract.
+
+  All fields are NORMALIZED: rho_h = c_h = phi_h = 1 at homeostasis.
+
+  Runtime overrides (no rebuild needed):
+    WOUND_MESH      mesh file name              (default 20t_finer)
+    WOUND_TSETTLE   phase-1 duration [h]        (default 100)
+    WOUND_TFINAL    phase-2 duration [h]        (default 673 = 4 weeks)
+    WOUND_OUT       output prefix               (default wound_1)
+    WOUND_PATCH     free-patch radius / r_wound (default 4)
+    WOUND_NOWOUND   set to skip phase 2 (homeostasis test only)
+    WOUND_VERBOSE   full node/element/dof dumps
 */
 
 #include <omp.h>
@@ -14,7 +37,9 @@ Solve.
 #include "myMeshGenerator.h"
 #include "element_functions.h"
 #include "local_solver.h"
+#include "mechanosensing.h"
 #include <iostream>
+#include <iomanip>
 #include <fstream>
 #include <cmath>
 #include <cstdlib>
@@ -27,7 +52,6 @@ Solve.
 #include <Eigen/Core>
 using namespace Eigen;
 // MKL is included through the CMake file
-// #define EIGEN_USE_MKL_ALL
 
 double frand(double fMin, double fMax)
 {
@@ -35,25 +59,26 @@ double frand(double fMin, double fMax)
     return fMin + f * (fMax - fMin);
 }
 
+//---------------------------------------------------------------------------//
+// Local orthonormal frame for a cylinder about the z axis:
+//   a0 axial, n0 radial (through-thickness), s0 circumferential.
+//---------------------------------------------------------------------------//
 inline void build_cylinder_frame(
-    const Eigen::Vector3d& X,              // point location
-    const Eigen::Vector3d& a0_in,           // preferred fiber direction (axial)
-    double xc, double yc,                   // cylinder center in x-y
+    const Eigen::Vector3d& X,
+    const Eigen::Vector3d& a0_in,
+    double xc, double yc,
     Eigen::Vector3d& a0,
     Eigen::Vector3d& s0,
     Eigen::Vector3d& n0
 ){
     const double eps = 1e-12;
 
-    // 1) normalize a0
     a0 = a0_in;
     if(a0.norm() < eps) a0 = Eigen::Vector3d(0,0,1);
     a0.normalize();
 
-    // 2) geometric normal = radial direction (project to x-y plane)
     Eigen::Vector3d r(X(0) - xc, X(1) - yc, 0.0);
     if(r.norm() < eps){
-        // pathological: point on axis; choose any normal perpendicular to a0
         Eigen::Vector3d tmp = (std::abs(a0.dot(Eigen::Vector3d::UnitX())) < 0.9)
                               ? Eigen::Vector3d::UnitX()
                               : Eigen::Vector3d::UnitY();
@@ -63,10 +88,8 @@ inline void build_cylinder_frame(
     }
     n0.normalize();
 
-    // 3) circumferential/tangential direction
     s0 = n0.cross(a0);
     if(s0.norm() < eps){
-        // a0 parallel to n0 (shouldn't happen for axial a0, but be robust)
         Eigen::Vector3d tmp = (std::abs(n0.dot(Eigen::Vector3d::UnitZ())) < 0.9)
                               ? Eigen::Vector3d::UnitZ()
                               : Eigen::Vector3d::UnitX();
@@ -74,591 +97,666 @@ inline void build_cylinder_frame(
     }
     s0.normalize();
 
-    // 4) re-orthogonalize n0 to guarantee right-handed orthonormal frame
     n0 = a0.cross(s0);
     n0.normalize();
-
-    // Optional: enforce n0 outward (for a cylinder centered at xc,yc outward already)
-    // Optional: enforce a consistent sign (e.g., n0(2) >= 0) if you need continuity
 }
 
+//---------------------------------------------------------------------------//
+// PHYSIOLOGICAL PRESTRETCH of a cylindrical shell.
+//
+// A plain diag(lam_th, lam_th, lam_z) is WRONG: its determinant is
+// lam_th^2 lam_z = 1.176, so it inflates volume and THICKENS the shell, when
+// incompressibility requires it to thin. The three stretches are distinct:
+//   axial            lam_z  = 1.098
+//   circumferential  lam_th = 1.035   -> mid-surface radius scales by lam_th
+//   through-thickness lam_r = 1/(lam_z lam_th) -> offset from mid-surface scales
+// which gives det F = 1 exactly and theta_e = ||cof F.n0|| = lam_th lam_z.
+//---------------------------------------------------------------------------//
+inline Eigen::Vector3d prestretch_target(const Eigen::Vector3d& X,
+                                         double r_mid, double lam_th, double lam_z)
+{
+    const double lam_r = 1.0/(lam_z*lam_th);
+    const double r = std::sqrt(X(0)*X(0) + X(1)*X(1));
+    if(r < 1e-12) return Eigen::Vector3d(X(0), X(1), X(2)*lam_z);
+    const double s  = r - r_mid;                    // signed through-thickness offset
+    const double r2 = r_mid*lam_th + s*lam_r;       // new radius
+    return Eigen::Vector3d(X(0)*r2/r, X(1)*r2/r, X(2)*lam_z);
+}
+
+//---------------------------------------------------------------------------//
+// Diagnostic: recompute theta_e and H at every integration point directly from
+// the tissue state, and report the spread of the nodal fields. Deliberately
+// independent of the solver internals so it acts as a check on them.
+//---------------------------------------------------------------------------//
+static void reportState(const tissue& myTissue, const std::vector<Vector4d>& IP,
+                        const char* label)
+{
+    const int elem_size = (int)myTissue.vol_elem_connectivity[0].size();
+    const int IP_size   = (int)IP.size();
+
+    double th_min= 1e30, th_max=-1e30, th_sum=0.0;
+    double H_min = 1e30, H_max =-1e30, H_sum =0.0;
+    double Je_min= 1e30, Je_max=-1e30;
+    long   n=0;
+
+    const double vartheta_e  = myTissue.global_parameters[16];
+    const double gamma_theta = myTissue.global_parameters[17];
+
+    for(int ei=0; ei<myTissue.n_vol_elem; ei++){
+        const std::vector<int>& e = myTissue.vol_elem_connectivity[ei];
+        for(int ip=0; ip<IP_size; ip++){
+            const double xi=IP[ip](0), eta=IP[ip](1), zeta=IP[ip](2);
+            std::vector<double> Rxi, Reta, Rzeta;
+            if(elem_size==4){
+                Rxi  = evalShapeFunctionsTetRxi(xi,eta,zeta);
+                Reta = evalShapeFunctionsTetReta(xi,eta,zeta);
+                Rzeta= evalShapeFunctionsTetRzeta(xi,eta,zeta);
+            } else if(elem_size==10){
+                Rxi  = evalShapeFunctionsTetQuadraticRxi(xi,eta,zeta);
+                Reta = evalShapeFunctionsTetQuadraticReta(xi,eta,zeta);
+                Rzeta= evalShapeFunctionsTetQuadraticRzeta(xi,eta,zeta);
+            } else if(elem_size==8){
+                Rxi  = evalShapeFunctionsRxi(xi,eta,zeta);
+                Reta = evalShapeFunctionsReta(xi,eta,zeta);
+                Rzeta= evalShapeFunctionsRzeta(xi,eta,zeta);
+            } else if(elem_size==20){
+                Rxi  = evalShapeFunctionsQuadraticRxi(xi,eta,zeta);
+                Reta = evalShapeFunctionsQuadraticReta(xi,eta,zeta);
+                Rzeta= evalShapeFunctionsQuadraticRzeta(xi,eta,zeta);
+            } else {
+                Rxi  = evalShapeFunctionsQuadraticLagrangeRxi(xi,eta,zeta);
+                Reta = evalShapeFunctionsQuadraticLagrangeReta(xi,eta,zeta);
+                Rzeta= evalShapeFunctionsQuadraticLagrangeRzeta(xi,eta,zeta);
+            }
+            Vector3d dxdxi=Vector3d::Zero(), dxdeta=Vector3d::Zero(), dxdzeta=Vector3d::Zero();
+            for(int ni=0; ni<elem_size; ni++){
+                dxdxi   += myTissue.node_x[e[ni]]*Rxi[ni];
+                dxdeta  += myTissue.node_x[e[ni]]*Reta[ni];
+                dxdzeta += myTissue.node_x[e[ni]]*Rzeta[ni];
+            }
+            Matrix3d dxdXi;
+            dxdXi << dxdxi(0), dxdeta(0), dxdzeta(0),
+                     dxdxi(1), dxdeta(1), dxdzeta(1),
+                     dxdxi(2), dxdeta(2), dxdzeta(2);
+            const Matrix3d FF = dxdXi*myTissue.elem_jac_IP[ei][ip].transpose();
+            const Matrix3d CC = FF.transpose()*FF;
+            const double J = FF.determinant();
+
+            const int g = ei*IP_size+ip;
+            const Vector3d& n0     = myTissue.ip_n0[g];
+            const Vector3d& lamdaP = myTissue.ip_lamdaP[g];
+
+            const double th = evalThetaE(J, CC.inverse(), n0, lamdaP(0), lamdaP(1));
+            const double H  = evalHe(th, vartheta_e, gamma_theta);
+            const double Je = J/(lamdaP(0)*lamdaP(1)*lamdaP(2));
+
+            th_min=std::min(th_min,th); th_max=std::max(th_max,th); th_sum+=th;
+            H_min =std::min(H_min ,H ); H_max =std::max(H_max ,H ); H_sum +=H;
+            Je_min=std::min(Je_min,Je); Je_max=std::max(Je_max,Je);
+            n++;
+        }
+    }
+
+    auto span = [](const std::vector<double>& v, double& lo, double& hi, double& mean){
+        lo=1e30; hi=-1e30; mean=0.0;
+        for(double x : v){ lo=std::min(lo,x); hi=std::max(hi,x); mean+=x; }
+        if(!v.empty()) mean/=(double)v.size();
+    };
+    double rlo,rhi,rmean, clo,chi,cmean, plo,phi_hi,pmean;
+    span(myTissue.node_rho, rlo,rhi,rmean);
+    span(myTissue.node_c,   clo,chi,cmean);
+    span(myTissue.ip_phif,  plo,phi_hi,pmean);
+
+    std::cout<<"\n================ STATE REPORT: "<<label<<" ================\n";
+    std::cout<<std::fixed<<std::setprecision(6);
+    std::cout<<"  theta_e  min/mean/max : "<<th_min<<" / "<<th_sum/n<<" / "<<th_max<<"\n";
+    std::cout<<"  H        min/mean/max : "<<H_min <<" / "<<H_sum /n<<" / "<<H_max <<"\n";
+    std::cout<<"  det(F^e) min/max      : "<<Je_min<<" / "<<Je_max<<"   (1 if incompressible)\n";
+    std::cout<<"  rho      min/mean/max : "<<rlo<<" / "<<rmean<<" / "<<rhi<<"\n";
+    std::cout<<"  c        min/mean/max : "<<clo<<" / "<<cmean<<" / "<<chi<<"\n";
+    std::cout<<"  phi      min/mean/max : "<<plo<<" / "<<pmean<<" / "<<phi_hi<<"\n";
+    if(rlo<0.0 || clo<0.0 || plo<0.0)
+        std::cout<<"  *** WARNING: negative concentration - solver has no clamping ***\n";
+    std::cout<<"===========================================================\n\n";
+    std::cout.unsetf(std::ios::fixed);
+}
 
 int main(int argc, char *argv[])
 {
     Eigen::initParallel();
-	std::cout<<"\nRunning full domain simulations with " << Eigen::nbThreads( ) << " threads.\n";
-	srand (time(NULL));
+    std::cout<<"\nRunning full domain simulations with " << Eigen::nbThreads( ) << " threads.\n";
+    srand (time(NULL));
 
-	// Verbose diagnostics (full node/element/jacobian/dof dumps) are off by
-	// default: on a fine mesh they emit gigabytes of stdout. Turn on with
-	// WOUND_VERBOSE=1 in the environment.
-	const bool verbose = (std::getenv("WOUND_VERBOSE") != nullptr);
+    const bool verbose = (std::getenv("WOUND_VERBOSE") != nullptr);
+    auto env_str = [](const char* key, const std::string& fallback){
+        const char* v = std::getenv(key);
+        return (v && *v) ? std::string(v) : fallback;
+    };
+    auto env_dbl = [](const char* key, double fallback){
+        const char* v = std::getenv(key);
+        return (v && *v) ? std::atof(v) : fallback;
+    };
 
-	// Small helpers so verification runs can be steered without recompiling.
-	auto env_str = [](const char* key, const std::string& fallback){
-		const char* v = std::getenv(key);
-		return (v && *v) ? std::string(v) : fallback;
-	};
-	auto env_dbl = [](const char* key, double fallback){
-		const char* v = std::getenv(key);
-		return (v && *v) ? std::atof(v) : fallback;
-	};
+    //=======================================================================//
+    // NORMALIZED HOMEOSTATIC STATE
+    //=======================================================================//
+    // Everything is normalized by its physiological value, so homeostasis is
+    // (alpha, rho, c, phi) = (0, 1, 1, 1). This replaces the old dimensional
+    // set (rho_phys = 1000*55.05126 cells/mm^3, c_max = 1e-4 g/mm^3).
+    const double rho_h = 1.0;
+    const double c_h   = 1.0;
+    const double phi_h = 1.0;
 
-	// for normalization
-	double rho_phys = 1000*55.05126; // [cells/mm^3]
-	double c_max = 1.0e-4; // [g/mm3] from tgf beta review, 5e-5g/mm3 was good for tissues
+    // values for the wound (plan.md "We are using only the normalized values")
+    double rho_wound   = 1.0e-4;
+    double c_wound     = 1.0e-4;
+    double phif0_wound = 1.0e-2;
+    double kappa0_wound = 1./3;      // uniform dispersion
 
-	// values for the wound
-	double rho_wound = 1000; // [cells/mm^3]
-	double c_wound = c_max;
-	double phif0_wound = 0.01;
-	double kappa0_wound = 1./3; // fine. using the uniform dispersion
+    // values for the healthy tissue
+    double rho_healthy   = rho_h;
+    double c_healthy     = c_h;
+    double phif0_healthy = phi_h;
+    double kappa0_healthy = 0.024;   // fiber dispersion, from our own experiments
 
-	//---------------------------------//
-	// values for the healthy
-	double rho_healthy = rho_phys; // [cells/mm^3]
-	double c_healthy = 0.0; // 0.0;
-	double phif0_healthy = 1.0;
-	double kappa0_healthy = 0.024; // fiber dispersion from my own experiments. Zach : 1./3;
-    
-	//---------------------------------//
-	// GLOBAL PARAMETERS
-	double k0 = 0.02;  //  Breast:0.00667792 -->  neo hookean for skin, used previously, in MPa. Value is modified for each patient based on breast density calculation. (0.00667792 represents a patient with 33% fibroglandular tissue).
-	double kf = 40; // Breast: 0.015 --> stiffness of collagen in MPa, from previous paper
-	double k2 = 0.048; // used the same value as Zach. nonlinear exponential coefficient, non-dimensional
-	double t_rho = (1.28571E-6/55.05126); // Zach: (1.28571E-5/55.05126); 0.0045 force of fibroblasts in MPa, this is per cell. so, in an average sense this is the production by the natural density
-	double t_rho_c = (1.28571E-6*3.28571)/55.05126; // Zach: (1.28571E-5*3.28571)/55.05126 0.045 force of myofibroblasts enhanced by chemical, I'm assuming normalized chemical, otherwise I'd have to add a normalizing constant
-	double K_t = 0.2; // Saturation of mechanical force by collagen
-	double K_t_c = c_max/10.; // saturation of chemical on force. this can be calculated from steady state
-	double D_rhorho = 0.0833; // diffusion of cells in [mm^2/hour]; 0.0833 was used in Buganza et al. (2017) and Sohutskay et al. (2021), but the value is a placeholder and not implemented — actual value is defined in wound.cpp
-	double D_rhoc = 0; // diffusion of chemotactic gradient, an order of magnitude greater than random walk [mm^2/hour], not normalized
-	double D_cc = 0.01208; // 0.15 diffusion of chemical TGF, not normalized.
-	double p_rho = 0.04958333/55.05126; // in 1/hour production of fibroblasts naturally, proliferation rate, not normalized, based on data of doubling rate from commercial use
-	double p_rho_c = 0.015314; // production enhanced by the chem, if the chemical is normalized, then suggest two fold,
-	double p_rho_theta = p_rho/2; // enhanced production by theta
-	double K_rho_c = c_max/10.; // saturation of cell proliferation by chemical, this one is definitely not crucial, just has to be small enough <cmax
-    double K_rho_rho = 10000*55.05126; // saturation of cell by cell, from steady state
-	double vartheta_e = 2.; // physiological state of area stretch
-	double gamma_theta = 5.; // sensitivity of heaviside function
-	// const double H0 = 1.0 / (1.0 + std::exp(-gamma_theta * (vartheta_e - vartheta_e))); // 0.5??
-    // const double A         = p_rho
-	// 						+ p_rho_c * (c_max / (K_rho_c + c_max))
-	// 						+ p_rho_theta * H0;
-	// const double A         = p_rho
-							// + p_rho_theta * H0;
-	// double d_rho           = A * (1.0 - rho_phys / K_rho_rho);
+    //=======================================================================//
+    // MECHANOSENSING
+    //=======================================================================//
+    // theta_e is the in-plane AREAL elastic stretch ||cof(F^e).n0||.
+    // vartheta_e is the measured adult dural areal prestretch 1.098*1.035, so
+    // H(vartheta_e) = 1/2 exactly in the healthy prestretched state. Every
+    // derived parameter below assumes H_h = 1/2.
+    double vartheta_e  = 1.136;
+    double gamma_theta = 10.0;
+    const double H_h   = 0.5;
 
-	
-	
-    double d_rho = p_rho*(1-rho_phys/K_rho_rho); // percent of cells die per day, 0.1*p_rho 10% in the original, now much less, determined to keep cells in dermis constant
-	double p_c_rho = 90.0e-16/rho_phys*10;// production of c by cells in g/cells/h
-	double d_c = 0.01/2; // 0.01 decay of chemical in 1/hours
-	double K_c_c = 1.;// saturation of chem by chem, from steady state
-	double p_c_thetaE = 300.0e-16/rho_phys*10; // coupling of elastic and chemical, three fold
-	// double p_c_thetaE      = (d_c * c_max * c_max
-	// 							+ (d_c * K_c_c - p_c_rho * rho_phys) * c_max)
-	// 							/ (H0 * rho_phys);
-	double bx = 0; // body force
-    double by = 0; //-0.001; // body force
-    double bz = 0; // body force
-	//---------------------------------//
-	std::vector<double> global_parameters = {k0,kf,k2,t_rho,t_rho_c,K_t,K_t_c,D_rhorho,D_rhoc,D_cc,p_rho,p_rho_c,p_rho_theta,K_rho_c,K_rho_rho,d_rho,vartheta_e,gamma_theta,p_c_rho,p_c_thetaE,K_c_c,d_c,bx,by,bz};
+    //=======================================================================//
+    // GLOBAL PARAMETERS
+    //=======================================================================//
+    // --- mechanics (unchanged from the previous dimensional set) ---
+    double k0 = 0.02;      // neo-Hookean ground substance [MPa]
+    double kf = 40.0;      // collagen fiber stiffness [MPa]
+    double k2 = 0.048;     // fiber exponential coefficient [-]
 
-	//---------------------------------//
-	// LOCAL PARAMETERS
-	//
-	// collagen fraction
-	double p_phi = 1.4E-8; // production by fibroblasts, natural rate in percent/hour, 5% per day
-	double p_phi_c = 7E-8; // production up-regulation, weighted by C and rho
-	double p_phi_theta = p_phi; // mechanosensing upregulation. no need to normalize by Hmax since Hmax = 1
-	double K_phi_c = 0.0001; // saturation of C effect on deposition.
-	double d_phi = 3.7413E-4; // rate of degradation, in the order of the wound process, 100 percent in one year for wound, means 0.000116 effective per hour means degradation = 0.002 - 0.000116
-	double d_phi_rho_c = 0.5*0.000970/rho_phys/c_max/10.0; //0.000194; // degradation coupled to chemical and cell density to maintain phi equilibrium
-	// const double G         = p_phi
-	// 						+ p_phi_c * (c_max / (K_phi_c + c_max))
-	// 						+ p_phi_theta * H0;
-	// const double C         = d_phi + d_phi_rho_c * c_max * rho_phys;
-	// double K_phi_rho       = (G * rho_phys) / (C * phif0_healthy) - phif0_healthy;
+    // Active (cell-generated) traction. In wound.cpp this enters as
+    //   traction_act = (t_rho + t_rho_c c/(K_t_c+c)) * rho
+    // so with rho normalized to 1 these must absorb the old rho_phys factor:
+    // the previous value 1.28571e-6/55.05126 multiplied by rho_phys = 55051.26
+    // is 1.28571e-3, i.e. this conversion is traction-PRESERVING.
+    double t_rho   = 1.28571e-3;              // [MPa] at rho = rho_h
+    double t_rho_c = 1.28571e-3*3.28571;      // enhancement by cytokine
+    double K_t     = 0.2;                     // saturation of traction by collagen
+    double K_t_c   = c_h/10.0;                // saturation of traction by cytokine
 
-	// const double G         = p_phi
-	// 						+ p_phi_theta * H0;
-	// const double C         = d_phi;
-	// double K_phi_rho       = (G * rho_phys) / (C * phif0_healthy) - phif0_healthy;
-	double K_phi_rho = rho_phys*p_phi/d_phi - 1; // saturation of collagen fraction itself, from steady state
-	
-	// fiber alignment
-	double tau_omega = 10./(K_phi_rho+1); // time constant for angular reorientation, think 100 percent in one year
-	//
-	// dispersion parameter
-	double tau_kappa = 1./(K_phi_rho+1); // time constant, on the order of a year
-	double gamma_kappa = 5.; // exponent of the principal stretch ratio
-	// 
-	// permanent contracture/growth
-	double tau_lamdaP_a =  0.05;// 5.0; // 1.0 time constant for direction a, on the order of a year
-	double tau_lamdaP_s =  0.05;// 5.0; // 1.0 time constant for direction s, on the order of a year
-    double tau_lamdaP_n =  0.05;// 5.0; // 1.0 time constant for direction s, on the order of a year
+    // --- transport ---
+    double D_rhorho = 0.0;      // UNUSED: global_parameters[7] is never read.
+                                // D_rho(phi) is defined by evalDrho() in wound.cpp.
+    double D_rhoc   = 0.0;      // fibroblast chemotaxis - neglected in this model
+    double D_cc     = 0.00930;  // cytokine diffusion [mm^2/h]
 
-    // solution parameters
-    double tol_local = 1e-8; // local tolerance (also try 1e-5)
-    double time_step_ratio = 100; // time step ratio between local and global (explicit)
-    double max_iter = 100; // max local iter (implicit)
+    // --- fibroblast kinetics [1/h] ---
+    double p_rho       = 0.0154;            // baseline proliferation
+    double p_rho_c     = 1.48*p_rho;        // cytokine-driven (ratio 1.48)
+    double p_rho_theta = 0.109*p_rho;       // mechano-driven  (ratio 0.109)
+    double K_rho_c     = 1.31;              // saturation of proliferation by c
+    double d_rho       = 0.00369;           // apoptosis
+
+    // --- cytokine kinetics [1/h] ---
+    double d_c     = 0.00386;               // decay
+    double K_c_c   = 1.20;                  // saturation of production by c
+    double r_c_e   = 0.447;                 // p_c_e / p_c_rho (fixed ratio)
+
+    double bx = 0.0, by = 0.0, bz = 0.0;    // body force
+
+    //=======================================================================//
+    // LOCAL PARAMETERS
+    //=======================================================================//
+    double p_phi       = 9.34e-4;           // baseline collagen production [1/h]
+    double p_phi_c     = 1.41e-3;           // cytokine-driven
+    double p_phi_theta = 4.96*p_phi;        // mechano-driven (ratio 4.96)
+    double K_phi_c     = 1.08;              // saturation of deposition by c
+                                            // NOT 1e-4: that was a c-scale artifact
+    double d_phi       = 2.02e-3;           // baseline degradation [1/h]
+    double d_phi_rho_c = 2.87e-4;           // degradation coupled to c and rho
+
+    //=======================================================================//
+    // DERIVED PARAMETERS - enforce (0,1,1,1) as an exact fixed point
+    //=======================================================================//
+    // Computed from the closed forms rather than hard-coded, so that any later
+    // change to a sampled parameter automatically keeps homeostasis exact.
+
+    // Fibroblast carrying capacity, from s_rho = 0.
+    double prolif_h  = p_rho + p_rho_c*c_h/(K_rho_c+c_h) + p_rho_theta*H_h;
+    double K_rho_rho = rho_h/(1.0 - d_rho/prolif_h);
+
+    // Collagen saturation by rho, from phi_dot = 0.
+    double K_phi_rho = (p_phi + p_phi_c*c_h/(K_phi_c+c_h) + p_phi_theta*H_h)*rho_h
+                     / ((d_phi + c_h*rho_h*d_phi_rho_c)*phi_h) - phi_h;
+
+    // Cytokine baseline production, from s_c = 0 (the alpha term vanishes
+    // because alpha_h = 0). We sample K_c_c and back-solve p_c_rho.
+    double p_c_rho    = d_c*(K_c_c + 1.0)/(1.0 + H_h*r_c_e);
+    double p_c_thetaE = r_c_e*p_c_rho;
+
+    // Admissibility. plan.md warns that a GP fit once returned K_phi_rho =
+    // -0.205 from this same constraint, so fail loudly rather than silently.
+    if(!(K_phi_rho > 0.0))
+        throw std::runtime_error("K_phi_rho <= 0: collagen production too weak "
+                                 "relative to degradation for a physiological fixed point.");
+    if(!(K_rho_rho > rho_h))
+        throw std::runtime_error("K_rho_rho <= rho_h: apoptosis exceeds the "
+                                 "homeostatic proliferation budget.");
+
     //---------------------------------//
-	std::vector<double> local_parameters = {p_phi,p_phi_c,p_phi_theta,K_phi_c,K_phi_rho,d_phi,d_phi_rho_c,tau_omega,tau_kappa,gamma_kappa,tau_lamdaP_a,tau_lamdaP_s,tau_lamdaP_n,vartheta_e,gamma_theta,tol_local,time_step_ratio,max_iter};
+    std::vector<double> global_parameters = {k0,kf,k2,t_rho,t_rho_c,K_t,K_t_c,
+        D_rhorho,D_rhoc,D_cc,p_rho,p_rho_c,p_rho_theta,K_rho_c,K_rho_rho,d_rho,
+        vartheta_e,gamma_theta,p_c_rho,p_c_thetaE,K_c_c,d_c,bx,by,bz};
 
-	
-	
-	//---------------------------------//
-	// double a0x = frand(-1,1.);
-    // double a0y = frand(-1,1.);
-    // double a0z = 0.;
-    Vector3d a0_wound; a0_wound << 0.0, 0.0, 1.0; // start with the same axial orientation.
-    // a0_wound = a0_wound/sqrt(a0_wound.dot(a0_wound));
-	Vector3d lamda0_wound;lamda0_wound << 1.,1.,1.;
-	//---------------------------------//
-	Vector3d a0_healthy;a0_healthy<<0.,0.,1.; // assuming the collagen is oriented along the longitudinal direction
- 	Vector3d lamda0_healthy;lamda0_healthy<<1.,1.,1.;
-	//---------------------------------//
+    // fiber reorientation / dispersion time constants, co-scaled with K_phi_rho
+    double tau_omega = 10./(K_phi_rho+1);
+    double tau_kappa = 1./(K_phi_rho+1);
+    double gamma_kappa = 5.;
+    // permanent contracture/growth. NOTE: unlike tau_omega/tau_kappa these are
+    // NOT co-scaled with K_phi_rho, so the plastic growth rate moves with the
+    // renormalization. Revisit if lamdaP misbehaves.
+    double tau_lamdaP_a = 0.05;
+    double tau_lamdaP_s = 0.05;
+    double tau_lamdaP_n = 0.05;
 
+    double tol_local = 1e-8;        // inert in the explicit local solver
+    double time_step_ratio = 100;   // local substeps per global step
+    double max_iter = 100;          // inert in the explicit local solver
 
-    // --------- Invalid for dura mater with cylindrical geometry --------------//
-    // Matrix3d Rot90;Rot90 << 0.,-1.,0., 1.,0.,0., 0.,0.,1.;
-    // Vector3d s0_wound = Rot90*a0_wound;
-    // Vector3d s0_healthy= Rot90*a0_healthy;
-    // Vector3d n0_wound = s0_wound.cross(a0_wound);
-    // if(n0_wound(2)<0){
-    //     n0_wound = a0_wound.cross(s0_wound);
-    // }
-    // Vector3d n0_healthy= s0_healthy.cross(a0_healthy);
-    // if(n0_healthy(2)<0){
-    //     n0_healthy = a0_healthy.cross(s0_healthy);
-    // }
+    std::vector<double> local_parameters = {p_phi,p_phi_c,p_phi_theta,K_phi_c,
+        K_phi_rho,d_phi,d_phi_rho_c,tau_omega,tau_kappa,gamma_kappa,
+        tau_lamdaP_a,tau_lamdaP_s,tau_lamdaP_n,vartheta_e,gamma_theta,
+        tol_local,time_step_ratio,max_iter};
+
     //---------------------------------//
+    // Echo the parameter set and check the fixed point numerically.
+    std::cout<<"\n===================== PARAMETERS (normalized) =====================\n";
+    std::cout<<std::scientific<<std::setprecision(6);
+    const char* gnames[] = {"k0","kf","k2","t_rho","t_rho_c","K_t","K_t_c",
+        "D_rhorho(unused)","D_rhoc","D_cc","p_rho","p_rho_c","p_rho_theta",
+        "K_rho_c","K_rho_rho*","d_rho","vartheta_e","gamma_theta","p_c_rho*",
+        "p_c_thetaE*","K_c_c","d_c","bx","by","bz"};
+    for(size_t i=0;i<global_parameters.size();i++)
+        std::cout<<"  global["<<std::setw(2)<<i<<"] "<<std::setw(18)<<gnames[i]
+                 <<" = "<<global_parameters[i]<<"\n";
+    const char* lnames[] = {"p_phi","p_phi_c","p_phi_theta","K_phi_c","K_phi_rho*",
+        "d_phi","d_phi_rho_c","tau_omega*","tau_kappa*","gamma_kappa",
+        "tau_lamdaP_a","tau_lamdaP_s","tau_lamdaP_n","vartheta_e","gamma_theta",
+        "tol_local","time_step_ratio","max_iter"};
+    for(size_t i=0;i<local_parameters.size();i++)
+        std::cout<<"  local ["<<std::setw(2)<<i<<"] "<<std::setw(18)<<lnames[i]
+                 <<" = "<<local_parameters[i]<<"\n";
+    std::cout<<"  (* = derived to enforce homeostasis)\n";
 
-	Vector3d s0_healthy(1.,0.,0.);
-	Vector3d n0_healthy(0.,1.,0.);
-	Vector3d s0_wound = s0_healthy;
-	Vector3d n0_wound = n0_healthy;
+    {
+        // Residuals of the three source terms at (alpha,rho,c,phi)=(0,1,1,1),H=1/2.
+        double S_rho = (p_rho + p_rho_c*c_h/(K_rho_c+c_h) + p_rho_theta*H_h)
+                       *(1.0-rho_h/K_rho_rho)*rho_h - d_rho*rho_h;
+        double S_c   = (p_c_rho*c_h + p_c_thetaE*H_h)*(rho_h/(K_c_c+c_h)) - d_c*c_h;
+        double S_phi = (p_phi + p_phi_c*c_h/(K_phi_c+c_h) + p_phi_theta*H_h)
+                       *(rho_h/(K_phi_rho+phi_h))
+                       - (d_phi + c_h*rho_h*d_phi_rho_c)*phi_h;
+        std::cout<<"\n  Fixed-point residuals at (rho,c,phi)=(1,1,1), H=1/2:\n";
+        std::cout<<"    s_rho = "<<S_rho<<"\n    s_c   = "<<S_c
+                 <<"\n    s_phi = "<<S_phi<<"\n";
+        const double worst = std::max(std::max(std::fabs(S_rho),std::fabs(S_c)),
+                                      std::fabs(S_phi));
+        if(worst > 1e-12)
+            std::cout<<"  *** WARNING: homeostasis not exact (worst "<<worst<<") ***\n";
+        else
+            std::cout<<"  homeostasis exact to machine precision.\n";
+    }
+    std::cout<<"===================================================================\n\n";
+    std::cout.unsetf(std::ios::scientific);
 
+    //=======================================================================//
+    // GEOMETRY AND MESH
+    //=======================================================================//
+    std::cout<<"Going to create the mesh\n";
+    double r_cord  = 5.0;    // [mm] radius of the spinal cord
+    double t_dura  = 0.4;    // [mm] dura thickness
+    double r_wound = 0.25;   // [mm] 25-gauge needle
+    double Xmin = -(r_cord + t_dura);
+    double Xmax =  (r_cord + t_dura);
+    double Ymin = Xmin, Ymax = Xmax;
+    double Zmin = 0.0,  Zmax = 10.0;
+    std::vector<double> hexDimensions = {Xmin, Xmax, Ymin, Ymax, Zmin, Zmax};
+    std::vector<int> meshResolution =  {16,16,6};
 
-	
-	//---------------------------------//
-	// create mesh (only nodes and elements)
-	std::cout<<"Going to create the mesh\n";
-    // The hex dimensions should be specified here even if you are importing a file!
-    // This will allow correct specification of the boundary values
-
-    // geometry dimensions:
-    double r_cord = 5.0; // [mm] radius of the spinal cord
-    double t_dura = 0.4; // [mm] thickness of the dura mater.
-    double r_wound = 0.25; // [mm] 25 gauge needle
-    double h_lumbar = 10.0; // [mm] approximate length of the lumbar dura
-    double Xmin = -(r_cord + t_dura); //
-    double Xmax = (r_cord + t_dura); //
-    double Ymin = Xmin;
-    double Ymax = Xmax;
-    double Zmin = 0.0;
-    double Zmax = 10.0;
-	std::vector<double> hexDimensions = {Xmin, Xmax, Ymin, Ymax, Zmin, Zmax};
-	std::vector<int> meshResolution =  {16,16,6};
-    std::string mesh_filename = env_str("WOUND_MESH", "dura_cyl_repeated_wound_v62_20t_finer.mphtxt"); // CHANGE
+    std::string mesh_filename = env_str("WOUND_MESH",
+                                        "dura_cyl_repeated_wound_v62_20t_finer.mphtxt");
     std::cout<<"mesh file: "<<mesh_filename<<"\n";
     HexMesh myMesh = readCOMSOLInput(mesh_filename, hexDimensions, meshResolution);
 
-    // Other possibles meshes:
-	//HexMesh myLinearMesh = myHexMesh(hexDimensions, meshResolution);
-    //HexMesh myMesh = myQuadraticHexMesh(hexDimensions, meshResolution);
-    //HexMesh myMesh = myQuadraticLagrangianHexMesh(hexDimensions, meshResolution);
-	//HexMesh myMesh = myMultiBlockMesh(hexDimensions, meshResolution);
-    //std::string mesh_filename = "COMSOL_3D_hex_linear_100x30.vtk";
-    //HexMesh myMesh = readParaviewInput(mesh_filename, hexDimensions, meshResolution);
-    //HexMesh myMesh = SerendipityQuadraticHexMeshfromLinear(myLinearMesh, hexDimensions, meshResolution);
+    std::cout<<"Created the mesh with "<<myMesh.n_nodes<<" nodes and "
+             <<myMesh.boundary_flag.size()<<" boundaries and "
+             <<myMesh.n_elements<<" elements\n";
+    if(verbose){
+        std::cout<<"nodes\n";
+        for(int nodei=0;nodei<myMesh.n_nodes;nodei++)
+            std::cout<<myMesh.nodes[nodei](0)<<","<<myMesh.nodes[nodei](1)<<","
+                     <<myMesh.nodes[nodei](2)<<"\n";
+        std::cout<<"elements\n";
+        for(int elemi=0;elemi<myMesh.n_elements;elemi++){
+            for(size_t nodei=0;nodei<myMesh.elements[elemi].size();nodei++)
+                std::cout<<myMesh.elements[elemi][nodei]<<" ";
+            std::cout<<"\n";
+        }
+        std::cout<<"boundary\n";
+        for(int nodei=0;nodei<myMesh.n_nodes;nodei++)
+            std::cout<<myMesh.boundary_flag[nodei]<<"\n";
+    }
 
-    std::cout<<"Created the mesh with "<<myMesh.n_nodes<<" nodes and "<<myMesh.boundary_flag.size()<<" boundaries and "<<myMesh.n_elements<<" elements\n";
-    std::cout<<"Created the surface mesh with "<<myMesh.n_nodes<<" nodes and "<<myMesh.surface_boundary_flag.size()<<" boundaries and "<<myMesh.n_surf_elements<<" elements\n";
-	// Dump the full mesh only when asked. On a fine mesh these loops emit
-	// gigabytes of stdout, which dominates the runtime of a production job.
-	// Enable with:  WOUND_VERBOSE=1 ./woundcpp3D
-	if(verbose){
-		// prints x, y, z coordinates
-		std::cout<<"nodes\n";
-		for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
-			std::cout<<myMesh.nodes[nodei](0)<<","<<myMesh.nodes[nodei](1)<<","<<myMesh.nodes[nodei](2)<<"\n";
-		}
-		// prints nodes associated with each element
-		std::cout<<"elements\n";
-		for(int elemi=0;elemi<myMesh.n_elements;elemi++){
-			for(int nodei=0;nodei<myMesh.elements[elemi].size();nodei++){
-				std::cout<<myMesh.elements[elemi][nodei]<<" ";
-			}
-			std::cout<<"\n";
-		}
-		// prints boundary
-		std::cout<<"boundary\n";
-		for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
-			std::cout<<myMesh.boundary_flag[nodei]<<"\n";
-		}
-	}
-	// create the other fields needed in the tissue struct.
-	int elem_size = myMesh.elements[0].size();
-	// integration points
+    int elem_size = myMesh.elements[0].size();
     std::vector<Vector4d> IP;
-    if(elem_size == 8 || elem_size == 20){
-        // linear hexahedron
-        IP = LineQuadriIP();
-    }
-    else if(elem_size == 27){
-        // quadratic hexahedron
-        IP = LineQuadriIPQuadratic();
-    }
-    else if(elem_size==4){
-        // linear tetrahedron
-        IP = LineQuadriIPTet();
-    }
-    else if(elem_size==10){
-        // quadratic tetrahedron
-        IP = LineQuadriIPTetQuadratic();
-    }
+    if(elem_size == 8 || elem_size == 20)      IP = LineQuadriIP();
+    else if(elem_size == 27)                   IP = LineQuadriIPQuadratic();
+    else if(elem_size == 4)                    IP = LineQuadriIPTet();
+    else if(elem_size == 10)                   IP = LineQuadriIPTetQuadratic();
+    else throw std::runtime_error("Wrong number of nodes in element!");
     int IP_size = IP.size();
-	//
-	// global fields rho and c initial conditions 
-	std::vector<double> node_rho0(myMesh.n_nodes,rho_healthy);
-	std::vector<double> node_c0 (myMesh.n_nodes,c_healthy);
-	//
-	// values at the (8) integration points
-	std::vector<double> ip_phi0(myMesh.n_elements*IP_size,phif0_healthy);
-	std::vector<Vector3d> ip_a00(myMesh.n_elements*IP_size,a0_healthy);
-    std::vector<Vector3d> ip_s00(myMesh.n_elements*IP_size,s0_healthy); // will update it later inside
-    std::vector<Vector3d> ip_n00(myMesh.n_elements*IP_size,n0_healthy); // will update it later inside
-	std::vector<double> ip_kappa0(myMesh.n_elements*IP_size,kappa0_healthy);
-	std::vector<Vector3d> ip_lamda0(myMesh.n_elements*IP_size,lamda0_healthy);
-	//
+
+    //=======================================================================//
+    // WOUND LOCATION
+    //=======================================================================//
+    // A radial needle track: a cylinder whose axis is along -x, piercing the
+    // dura wall at (y_center, z_center).
+    // z_center is mid-length so the wound is far from both fixed end rings.
+    // This matches Z1_CENTER = 5.0 in scripts/analyze_multiwound_centers.py;
+    // the previous 2*t_dura = 0.8 sat almost on top of the clamped bottom ring.
     double tol_boundary = 1e-5;
-	// define wound domain. Note: These values are unique for each patient.
-	double y_center = 0.0; // assuming the wound is a cylinder along the -ve x axis
-	double z_center = 2*t_dura; // brought wound_1 down
-    const double Xmin_wound = Xmin-tol_boundary;
-    const double Xmax_wound = -r_cord+ 0.01;
-	
-	// boundary conditions and definition of the wound
-	std::map<int,double> eBC_x;
-	std::map<int,double> eBC_rho;
-	std::map<int,double> eBC_c;
-	for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
-		double x_coord = myMesh.nodes[nodei](0);
-		double y_coord = myMesh.nodes[nodei](1);
-		double z_coord = myMesh.nodes[nodei](2);
-		// check if node is fixed. Since tumor was in left breast, all nodes on the right breast are fixed (x_coord <= 0). All nodes past the chest wall are also fixed (y_coord >= 50)
-		
-		if(myMesh.boundary_flag[nodei] == 1){ 
+    double y_center = 0.0;
+    double z_center = 0.5*(Zmin + Zmax);
+    const double Xmin_wound = Xmin - tol_boundary;
+    const double Xmax_wound = -r_cord + 0.01;
 
-			// insert the boundary condition for displacement
-			if(verbose) std::cout<<"fixing node "<<nodei<<"\n";
-			eBC_x.insert ( std::pair<int,double>(nodei*3+0,myMesh.nodes[nodei](0)) ); // x coordinate
-			eBC_x.insert ( std::pair<int,double>(nodei*3+1,myMesh.nodes[nodei](1)) ); // y coordinate
-			eBC_x.insert ( std::pair<int,double>(nodei*3+2,myMesh.nodes[nodei](2)) ); // z coordinate
-			// insert the boundary condition for rho
-			eBC_rho.insert ( std::pair<int,double>(nodei,rho_healthy) );
-			// insert the boundary condition for c
-			eBC_c.insert   ( std::pair<int,double>(nodei, c_healthy)); //c_healthy // CHANGE
-		}
-		//-----------------//
-		
-        // test inside cylinder segment:
-        double r2 = (y_coord - y_center)*(y_coord - y_center) + (z_coord - z_center)*(z_coord - z_center);
+    //=======================================================================//
+    // PRESTRETCH
+    //=======================================================================//
+    const double r_mid  = r_cord + 0.5*t_dura;   // mid-surface radius, 5.2 mm
+    const double lam_z  = 1.098;                 // axial
+    const double lam_th = 1.035;                 // circumferential
+    std::cout<<"prestretch: lam_axial="<<lam_z<<" lam_circ="<<lam_th
+             <<" lam_thick="<<1.0/(lam_z*lam_th)
+             <<"  -> theta_e="<<lam_z*lam_th<<"\n";
 
-        bool inside_cyl = (x_coord >= Xmin_wound && x_coord <= Xmax_wound) && (r2 <= (r_wound+ tol_boundary)*(r_wound+ tol_boundary));
+    // Identify the outer boundary: the two end rings (already flagged by
+    // readCOMSOLInput via z) plus the inner and outer lateral surfaces, which
+    // we find geometrically.
+    const double r_in  = r_cord;
+    const double r_out = r_cord + t_dura;
+    const double tol_r = 1e-3;
+    std::vector<char> on_boundary(myMesh.n_nodes, 0);
+    int n_ring=0, n_lat=0;
+    for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
+        const Vector3d& X = myMesh.nodes[nodei];
+        const double r = std::sqrt(X(0)*X(0)+X(1)*X(1));
+        bool ring = (myMesh.boundary_flag[nodei] == 1);
+        bool lat  = (std::fabs(r-r_in) < tol_r) || (std::fabs(r-r_out) < tol_r);
+        if(ring) n_ring++;
+        if(lat)  n_lat++;
+        on_boundary[nodei] = (ring || lat) ? 1 : 0;
+    }
+    std::cout<<"boundary nodes: "<<n_ring<<" on end rings, "<<n_lat
+             <<" on lateral surfaces\n";
 
-        if(inside_cyl){
-            if(verbose) std::cout << "wound node " << nodei << "\n";
-            node_rho0[nodei] = rho_wound;
-            node_c0[nodei]   = c_wound;
-        }
+    // Prestretched target position for every node, and the initial guess.
+    std::vector<Vector3d> node_target(myMesh.n_nodes);
+    for(int nodei=0;nodei<myMesh.n_nodes;nodei++)
+        node_target[nodei] = prestretch_target(myMesh.nodes[nodei], r_mid, lam_th, lam_z);
 
-	}
-	for(int elemi=0;elemi<myMesh.n_elements;elemi++){
-		for(int ip=0;ip<IP_size;ip++)
-		{
-			double xi = IP[ip](0);
-			double eta = IP[ip](1);
-			double zeta = IP[ip](2);
-			// weight of the integration point
-			double wip = IP[ip](3);
+    //=======================================================================//
+    // INITIAL CONDITIONS - healthy everywhere (the wound comes in phase 2)
+    //=======================================================================//
+    std::vector<double> node_rho0(myMesh.n_nodes, rho_healthy);
+    std::vector<double> node_c0  (myMesh.n_nodes, c_healthy);
+    std::vector<double> ip_phi0  (myMesh.n_elements*IP_size, phif0_healthy);
+    std::vector<double> ip_kappa0(myMesh.n_elements*IP_size, kappa0_healthy);
+    Vector3d a0_healthy(0.,0.,1.);            // collagen along the axis
+    Vector3d lamda0_healthy(1.,1.,1.);
+    std::vector<Vector3d> ip_a00(myMesh.n_elements*IP_size, a0_healthy);
+    std::vector<Vector3d> ip_s00(myMesh.n_elements*IP_size, Vector3d(1.,0.,0.));
+    std::vector<Vector3d> ip_n00(myMesh.n_elements*IP_size, Vector3d(0.,1.,0.));
+    std::vector<Vector3d> ip_lamda0(myMesh.n_elements*IP_size, lamda0_healthy);
+
+    // Cylindrical fiber frame at every integration point.
+    for(int elemi=0;elemi<myMesh.n_elements;elemi++){
+        for(int ip=0;ip<IP_size;ip++){
             std::vector<double> R;
-            if(elem_size == 8){
-                R = evalShapeFunctionsR(xi,eta,zeta);
-            }
-            else if(elem_size == 20){
-                R = evalShapeFunctionsQuadraticR(xi,eta,zeta);
-            }
-            else if(elem_size == 27){
-                R = evalShapeFunctionsQuadraticLagrangeR(xi,eta,zeta);
-            }
-            else if(elem_size == 4){
-                R = evalShapeFunctionsTetR(xi,eta,zeta);
-            }
-            else if(elem_size == 10){
-                R = evalShapeFunctionsTetQuadraticR(xi,eta,zeta);
-            }
-            else{
-                throw std::runtime_error("Wrong number of nodes in element!");
-            }
-			Vector3d X_IP; X_IP.setZero();
-			for(int nodej=0;nodej<elem_size;nodej++){
-			    //std::cout<<R[nodej]<<"\n";
-                //std::cout<<myMesh.nodes[myMesh.elements[elemi][nodej]]<<"\n";
-				X_IP += R[nodej]*myMesh.nodes[myMesh.elements[elemi][nodej]];
-			}
+            const double xi=IP[ip](0), eta=IP[ip](1), zeta=IP[ip](2);
+            if(elem_size == 8)       R = evalShapeFunctionsR(xi,eta,zeta);
+            else if(elem_size == 20) R = evalShapeFunctionsQuadraticR(xi,eta,zeta);
+            else if(elem_size == 27) R = evalShapeFunctionsQuadraticLagrangeR(xi,eta,zeta);
+            else if(elem_size == 4)  R = evalShapeFunctionsTetR(xi,eta,zeta);
+            else                     R = evalShapeFunctionsTetQuadraticR(xi,eta,zeta);
+            Vector3d X_IP = Vector3d::Zero();
+            for(int nodej=0;nodej<elem_size;nodej++)
+                X_IP += R[nodej]*myMesh.nodes[myMesh.elements[elemi][nodej]];
+            Vector3d a0,s0,n0;
+            build_cylinder_frame(X_IP, a0_healthy, 0.0, 0.0, a0, s0, n0);
+            ip_a00[elemi*IP_size+ip] = a0;
+            ip_s00[elemi*IP_size+ip] = s0;
+            ip_n00[elemi*IP_size+ip] = n0;
+        }
+    }
 
-            // test inside cylinder segment:
-            double r2 = (X_IP(1) - y_center)*(X_IP(1) - y_center) + (X_IP(2)- z_center)*(X_IP(2) - z_center);
+    //=======================================================================//
+    // BOUNDARY CONDITIONS - phase 1: prestretch held on the whole boundary
+    //=======================================================================//
+    std::map<int,double> eBC_x, eBC_rho, eBC_c;
+    for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
+        if(!on_boundary[nodei]) continue;
+        if(verbose) std::cout<<"fixing node "<<nodei<<"\n";
+        eBC_x.insert(std::pair<int,double>(nodei*3+0, node_target[nodei](0)));
+        eBC_x.insert(std::pair<int,double>(nodei*3+1, node_target[nodei](1)));
+        eBC_x.insert(std::pair<int,double>(nodei*3+2, node_target[nodei](2)));
+        // hold the species at their healthy values on the end rings only;
+        // the lateral surfaces are free surfaces for transport
+        if(myMesh.boundary_flag[nodei] == 1){
+            eBC_rho.insert(std::pair<int,double>(nodei, rho_healthy));
+            eBC_c.insert  (std::pair<int,double>(nodei, c_healthy));
+        }
+    }
+    std::map<int,double> nBC_x, nBC_rho, nBC_c;   // unused: never read by the solver
 
-            bool inside_cyl = (X_IP(0) >= Xmin_wound && X_IP(0) <= Xmax_wound) && (r2 <= (r_wound+ tol_boundary)*(r_wound+ tol_boundary));
-
-            if(inside_cyl){
-                if(verbose) std::cout<<"IP node: "<<IP_size*elemi+ip<<"\n";
-				// update the wound geometry with orientations:
-				Eigen::Vector3d a0,s0,n0;
-				build_cylinder_frame(X_IP, a0_wound , 0.0, 0.0, a0, s0, n0);
-				ip_a00[elemi*IP_size+ip] = a0;
-				ip_s00[elemi*IP_size+ip] = s0;
-				ip_n00[elemi*IP_size+ip] = n0;		
-                ip_phi0[elemi*IP_size+ip] = phif0_wound;
-                ip_kappa0[elemi*IP_size+ip] = kappa0_wound;
-                ip_lamda0[elemi*IP_size+ip] = lamda0_wound;
-                
-            }
-			else{
-				Eigen::Vector3d a0,s0,n0;
-				build_cylinder_frame(X_IP, a0_healthy , 0.0, 0.0, a0, s0, n0);
-				ip_a00[elemi*IP_size+ip] = a0;
-				ip_s00[elemi*IP_size+ip] = s0;
-				ip_n00[elemi*IP_size+ip] = n0;		
-			}
-            
-            //-----------------//
-		}
-	}
-	// neumann boundary conditions.
-	std::map<int,double> nBC_x; /// This is a map from the node to the condition (three times as long for x)
-	std::map<int,double> nBC_rho; /// Could also use the map from face numbering
-	std::map<int,double> nBC_c; /// Make some kind of flag so that if we are running BC we don't update cells, etc
-
-	// initialize my tissue
-	tissue myTissue;
-	// connectivity
-	myTissue.vol_elem_connectivity = myMesh.elements;
+    //=======================================================================//
+    // ASSEMBLE THE TISSUE
+    //=======================================================================//
+    tissue myTissue;
+    myTissue.vol_elem_connectivity  = myMesh.elements;
     myTissue.surf_elem_connectivity = myMesh.surface_elements;
-	// parameters
-	myTissue.global_parameters = global_parameters;
-	myTissue.local_parameters = local_parameters;
-	myTissue.boundary_flag = myMesh.boundary_flag;
+    myTissue.global_parameters = global_parameters;
+    myTissue.local_parameters  = local_parameters;
+    myTissue.boundary_flag = myMesh.boundary_flag;
     myTissue.surface_boundary_flag = myMesh.surface_boundary_flag;
-	//
-	myTissue.node_X = myMesh.nodes;
-	myTissue.node_x = myMesh.nodes;
-	myTissue.node_rho_0 = node_rho0;
-	myTissue.node_rho = node_rho0;
-	myTissue.node_c_0 = node_c0;
-	myTissue.node_c = node_c0;
-	myTissue.ip_phif_0 = ip_phi0;	
-	myTissue.ip_phif = ip_phi0;	
-	myTissue.ip_a0_0 = ip_a00;
-	myTissue.ip_a0 = ip_a00;
-    myTissue.ip_s0_0 = ip_s00;
-    myTissue.ip_s0 = ip_s00;
-    myTissue.ip_n0_0 = ip_n00;
-    myTissue.ip_n0 = ip_n00;
-    myTissue.ip_kappa_0 = ip_kappa0;
-	myTissue.ip_kappa = ip_kappa0;	
-	myTissue.ip_lamdaP_0 = ip_lamda0;
-	myTissue.ip_lamdaP = ip_lamda0;
-    myTissue.ip_lamdaE = ip_lamda0;
-    std::vector<Matrix3d> ip_strain(myMesh.n_elements*IP_size,Matrix3d::Identity(3,3));
-    std::vector<Matrix3d> ip_stress(myMesh.n_elements*IP_size,Matrix3d::Zero(3,3));
-	myTissue.ip_strain = ip_strain;
-    myTissue.ip_stress = ip_stress;
-    //
-	myTissue.eBC_x = eBC_x;
-	myTissue.eBC_rho = eBC_rho;
-	myTissue.eBC_c = eBC_c;
-	myTissue.nBC_x = nBC_x;
-	myTissue.nBC_rho = nBC_rho;
-	myTissue.nBC_c = nBC_c;
-	myTissue.time_final = env_dbl("WOUND_TFINAL", (7*24*4)+1); // CHANGE
-	myTissue.time_step = 0.2;
-	myTissue.tol = 1e-8;
-	myTissue.max_iter = 25;
-	myTissue.n_node = myMesh.n_nodes;
-	myTissue.n_vol_elem = myMesh.n_elements;
-    myTissue.n_surf_elem = myMesh.n_surf_elements;
-	myTissue.n_IP = IP_size*myMesh.n_elements;
-	//
-	std::cout<<"filling dofs...\n";
-	fillDOFmap(myTissue);
-	std::cout<<"going to eval jacobians...\n";
-	evalElemJacobians(myTissue);
-    std::cout<<"going to eval surface jacobians...\n";
-    //evalElemJacobiansSurface(myTissue);
-	//
-	//print out the Jacobians
-	std::cout<<"element jacobians: "<<myTissue.elem_jac_IP.size()<<"\n";
-	std::cout<<"Total :"<<myTissue.n_dof<<" dof\n";
-	if(verbose){
-		for(int i=0;i<myTissue.elem_jac_IP.size();i++){
-			std::cout<<"element: "<<i<<"\n";
-			for(int j=0;j<IP_size;j++){
-				std::cout<<"ip; "<<j<<"\n"<<myTissue.elem_jac_IP[i][j]<<"\n";
-			}
-		}
-		// print out the forward dof map
-		for(int i=0;i<myTissue.dof_fwd_map_x.size();i++){
-			std::cout<<"x node*3+coord: "<<i<<", dof: "<<myTissue.dof_fwd_map_x[i]<<"\n";
-		}
-		for(int i=0;i<myTissue.dof_fwd_map_rho.size();i++){
-			std::cout<<"rho node: "<<i<<", dof: "<<myTissue.dof_fwd_map_rho[i]<<"\n";
-		}
-		for(int i=0;i<myTissue.dof_fwd_map_c.size();i++){
-			std::cout<<"c node: "<<i<<", dof: "<<myTissue.dof_fwd_map_c[i]<<"\n";
-		}
-	}
-	//
-	// 
-	std::cout<<"going to start solver\n";
-	// save a node and an integration point to a file
-	std::vector<int> save_node;save_node.clear();
-	std::vector<int> save_ip;save_ip.clear();
+    myTissue.node_X = myMesh.nodes;          // UNLOADED reference - never re-referenced
+    myTissue.node_x = node_target;           // start at the prestretched guess
+    myTissue.node_rho_0 = node_rho0;  myTissue.node_rho = node_rho0;
+    myTissue.node_c_0   = node_c0;    myTissue.node_c   = node_c0;
+    myTissue.ip_phif_0  = ip_phi0;    myTissue.ip_phif  = ip_phi0;
+    myTissue.ip_a0_0    = ip_a00;     myTissue.ip_a0    = ip_a00;
+    myTissue.ip_s0_0    = ip_s00;     myTissue.ip_s0    = ip_s00;
+    myTissue.ip_n0_0    = ip_n00;     myTissue.ip_n0    = ip_n00;
+    myTissue.ip_kappa_0 = ip_kappa0;  myTissue.ip_kappa = ip_kappa0;
+    myTissue.ip_lamdaP_0= ip_lamda0;  myTissue.ip_lamdaP= ip_lamda0;
+    myTissue.ip_lamdaE  = ip_lamda0;
+    myTissue.ip_strain = std::vector<Matrix3d>(myMesh.n_elements*IP_size, Matrix3d::Identity());
+    myTissue.ip_stress = std::vector<Matrix3d>(myMesh.n_elements*IP_size, Matrix3d::Zero());
+    myTissue.eBC_x = eBC_x;  myTissue.eBC_rho = eBC_rho;  myTissue.eBC_c = eBC_c;
+    myTissue.nBC_x = nBC_x;  myTissue.nBC_rho = nBC_rho;  myTissue.nBC_c = nBC_c;
+    myTissue.time       = 0.0;   // was never initialized: the solver reads it
+    myTissue.time_step  = 0.2;
+    myTissue.tol        = 1e-8;
+    myTissue.max_iter   = 25;
+    myTissue.n_node     = myMesh.n_nodes;
+    myTissue.n_vol_elem = myMesh.n_elements;
+    myTissue.n_surf_elem= myMesh.n_surf_elements;
+    myTissue.n_IP       = IP_size*myMesh.n_elements;
 
-	std::stringstream ss;
-	std::string filename = env_str("WOUND_OUT", "wound_1_20t_4w_output")+ss.str()+"_"; // CHANGE
+    std::cout<<"filling dofs...\n";
+    fillDOFmap(myTissue);
+    std::cout<<"going to eval jacobians...\n";
+    evalElemJacobians(myTissue);
 
-    // check the bc and wound initial conditions
-    // std::string tag = "REF_BC";
-
-    // std::string filename_step  = "wound_1_12t_output_" + tag + ".vtk"; // CHANGE
-    // std::string filename_step2 = "wound_1_20t_output_second_" + tag + ".vtk"; // CHANGE
-
-    // writeParaview(myTissue,
-    //           filename_step.c_str(),
-    //           filename_step2.c_str());
-
-	//----------------------------------------------------------//
-	// SOLVE
-//    sparseLoadSolver(myTissue, filename, 1,save_node,save_ip);
-    sparseWoundSolver(myTissue, filename, 5,save_node,save_ip);
-	//----------------------------------------------------------//
-
-	// Here I want to inflict another wound.
-	// wound is along the same -ve x axis with same Xlimits
-	// with y_center = 0.0 and h_center = h_lumbar/2.0 + 2*t_dura
-	z_center = z_center + 20*t_dura; // CHANGE 
-	for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
-		double x_coord = myTissue.node_x[nodei](0);
-		double y_coord = myTissue.node_x[nodei](1);
-		double z_coord = myTissue.node_x[nodei](2);
-		
-        // test inside cylinder segment:
-        double r2 = (y_coord - y_center)*(y_coord - y_center) + (z_coord - z_center)*(z_coord - z_center);
-
-        bool inside_cyl = (x_coord >= Xmin_wound && x_coord <= Xmax_wound) && (r2 <= (r_wound+ tol_boundary)*(r_wound+ tol_boundary));
-
-        if(inside_cyl){
-            if(verbose) std::cout << "wound node " << nodei << "\n";
-			myTissue.node_rho_0[nodei] = rho_wound;
-			myTissue.node_rho[nodei] = rho_wound;
-			myTissue.node_c_0[nodei] = c_wound;
-			myTissue.node_c[nodei] = c_wound;
+    std::cout<<"element jacobians: "<<myTissue.elem_jac_IP.size()<<"\n";
+    std::cout<<"Total :"<<myTissue.n_dof<<" dof\n";
+    if(verbose){
+        for(size_t i=0;i<myTissue.elem_jac_IP.size();i++){
+            std::cout<<"element: "<<i<<"\n";
+            for(int j=0;j<IP_size;j++)
+                std::cout<<"ip; "<<j<<"\n"<<myTissue.elem_jac_IP[i][j]<<"\n";
         }
+        for(size_t i=0;i<myTissue.dof_fwd_map_x.size();i++)
+            std::cout<<"x node*3+coord: "<<i<<", dof: "<<myTissue.dof_fwd_map_x[i]<<"\n";
+        for(size_t i=0;i<myTissue.dof_fwd_map_rho.size();i++)
+            std::cout<<"rho node: "<<i<<", dof: "<<myTissue.dof_fwd_map_rho[i]<<"\n";
+        for(size_t i=0;i<myTissue.dof_fwd_map_c.size();i++)
+            std::cout<<"c node: "<<i<<", dof: "<<myTissue.dof_fwd_map_c[i]<<"\n";
+    }
 
-	}
-	for(int elemi=0;elemi<myMesh.n_elements;elemi++){
-		for(int ip=0;ip<IP_size;ip++)
-		{
-			double xi = IP[ip](0);
-			double eta = IP[ip](1);
-			double zeta = IP[ip](2);
-			// weight of the integration point
-			double wip = IP[ip](3);
+    std::vector<int> save_node; save_node.clear();
+    std::vector<int> save_ip;   save_ip.clear();
+    std::string out_prefix = env_str("WOUND_OUT", "wound_1");
+
+    // Boundary-condition / initial-condition check before solving anything.
+    {
+        std::string f1 = out_prefix + "_BCCHECK.vtk";
+        std::string f2 = out_prefix + "_second_BCCHECK.vtk";
+        writeParaview(myTissue, f1.c_str(), f2.c_str());
+        std::cout<<"wrote BC check: "<<f1<<"\n";
+    }
+    reportState(myTissue, IP, "initial guess (prestretch applied, before solve)");
+
+    //=======================================================================//
+    // PHASE 1: SETTLE THE PRESTRETCH (no wound)
+    //=======================================================================//
+    double t_settle = env_dbl("WOUND_TSETTLE", 100.0);
+    if(t_settle > 0.0){
+        myTissue.time = 0.0;
+        myTissue.time_final = t_settle;
+        std::string f = out_prefix + "_settle_";
+        std::cout<<"\n#### PHASE 1: prestretch settling for "<<t_settle
+                 <<" h (no wound) ####\n";
+        sparseWoundSolver(myTissue, f, 5, save_node, save_ip);
+        reportState(myTissue, IP, "after prestretch settling (HOMEOSTASIS GATE)");
+    }
+
+    if(std::getenv("WOUND_NOWOUND") != nullptr){
+        std::cout<<"WOUND_NOWOUND set - stopping after the homeostasis gate.\n";
+        return 0;
+    }
+
+    //=======================================================================//
+    // PHASE 2: SEED THE WOUND AND HEAL
+    //=======================================================================//
+    // Release the boundary inside a patch around the puncture so the wound can
+    // contract; the far field keeps holding theta_e = 1.136 / H = 1/2.
+    const double patch_mult   = env_dbl("WOUND_PATCH", 4.0);
+    const double patch_radius = patch_mult*r_wound;
+    {
+        std::map<int,double> eBC_x2, eBC_rho2, eBC_c2;
+        int n_freed = 0;
+        for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
+            if(!on_boundary[nodei]) continue;
+            // Distance from the needle track, measured in the plane normal to
+            // the track axis (which runs along x).
+            const Vector3d& X = myMesh.nodes[nodei];
+            const double d2 = (X(1)-y_center)*(X(1)-y_center)
+                            + (X(2)-z_center)*(X(2)-z_center);
+            const bool near_wound = (d2 < patch_radius*patch_radius) && (X(0) < 0.0);
+            if(near_wound){ n_freed++; continue; }
+            eBC_x2.insert(std::pair<int,double>(nodei*3+0, node_target[nodei](0)));
+            eBC_x2.insert(std::pair<int,double>(nodei*3+1, node_target[nodei](1)));
+            eBC_x2.insert(std::pair<int,double>(nodei*3+2, node_target[nodei](2)));
+            if(myMesh.boundary_flag[nodei] == 1){
+                eBC_rho2.insert(std::pair<int,double>(nodei, rho_healthy));
+                eBC_c2.insert  (std::pair<int,double>(nodei, c_healthy));
+            }
+        }
+        std::cout<<"\nfree patch radius "<<patch_radius<<" mm ("<<patch_mult
+                 <<"x r_wound): freed "<<n_freed<<" boundary nodes so the wound can contract\n";
+        myTissue.eBC_x = eBC_x2;
+        myTissue.eBC_rho = eBC_rho2;
+        myTissue.eBC_c = eBC_c2;
+        // Rebuild the dof maps for the new constraint set. fillDOFmap rebuilds
+        // dof_fwd_map_*, dof_inv_map and n_dof from scratch, so this is safe.
+        fillDOFmap(myTissue);
+        std::cout<<"Total :"<<myTissue.n_dof<<" dof after releasing the patch\n";
+    }
+
+    // Seed the wound into the already-deformed tissue. Membership is tested on
+    // the DEFORMED coordinates node_x, because the puncture is made in the
+    // prestretched in-vivo configuration, not in the unloaded reference.
+    int n_wound_nodes = 0, n_wound_ip = 0;
+    for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
+        const Vector3d& x = myTissue.node_x[nodei];
+        const double r2 = (x(1)-y_center)*(x(1)-y_center)
+                        + (x(2)-z_center)*(x(2)-z_center);
+        const bool inside = (x(0) >= Xmin_wound && x(0) <= Xmax_wound)
+                         && (r2 <= (r_wound+tol_boundary)*(r_wound+tol_boundary));
+        if(inside){
+            if(verbose) std::cout << "wound node " << nodei << "\n";
+            myTissue.node_rho_0[nodei] = rho_wound;
+            myTissue.node_rho[nodei]   = rho_wound;
+            myTissue.node_c_0[nodei]   = c_wound;
+            myTissue.node_c[nodei]     = c_wound;
+            n_wound_nodes++;
+        }
+    }
+    for(int elemi=0;elemi<myMesh.n_elements;elemi++){
+        for(int ip=0;ip<IP_size;ip++){
             std::vector<double> R;
-            if(elem_size == 8){
-                R = evalShapeFunctionsR(xi,eta,zeta);
+            const double xi=IP[ip](0), eta=IP[ip](1), zeta=IP[ip](2);
+            if(elem_size == 8)       R = evalShapeFunctionsR(xi,eta,zeta);
+            else if(elem_size == 20) R = evalShapeFunctionsQuadraticR(xi,eta,zeta);
+            else if(elem_size == 27) R = evalShapeFunctionsQuadraticLagrangeR(xi,eta,zeta);
+            else if(elem_size == 4)  R = evalShapeFunctionsTetR(xi,eta,zeta);
+            else                     R = evalShapeFunctionsTetQuadraticR(xi,eta,zeta);
+            Vector3d x_IP = Vector3d::Zero();
+            for(int nodej=0;nodej<elem_size;nodej++)
+                x_IP += R[nodej]*myTissue.node_x[myMesh.elements[elemi][nodej]];
+            const double r2 = (x_IP(1)-y_center)*(x_IP(1)-y_center)
+                            + (x_IP(2)-z_center)*(x_IP(2)-z_center);
+            const bool inside = (x_IP(0) >= Xmin_wound && x_IP(0) <= Xmax_wound)
+                             && (r2 <= (r_wound+tol_boundary)*(r_wound+tol_boundary));
+            if(inside){
+                const int g = elemi*IP_size+ip;
+                if(verbose) std::cout<<"IP node: "<<g<<"\n";
+                Vector3d a0,s0,n0;
+                build_cylinder_frame(x_IP, a0_healthy, 0.0, 0.0, a0, s0, n0);
+                myTissue.ip_phif_0[g] = phif0_wound;  myTissue.ip_phif[g] = phif0_wound;
+                myTissue.ip_a0_0[g]   = a0;           myTissue.ip_a0[g]   = a0;
+                myTissue.ip_s0_0[g]   = s0;           myTissue.ip_s0[g]   = s0;
+                myTissue.ip_n0_0[g]   = n0;           myTissue.ip_n0[g]   = n0;
+                myTissue.ip_kappa_0[g]= kappa0_wound; myTissue.ip_kappa[g]= kappa0_wound;
+                n_wound_ip++;
             }
-            else if(elem_size == 20){
-                R = evalShapeFunctionsQuadraticR(xi,eta,zeta);
-            }
-            else if(elem_size == 27){
-                R = evalShapeFunctionsQuadraticLagrangeR(xi,eta,zeta);
-            }
-            else if(elem_size == 4){
-                R = evalShapeFunctionsTetR(xi,eta,zeta);
-            }
-            else if(elem_size == 10){
-                R = evalShapeFunctionsTetQuadraticR(xi,eta,zeta);
-            }
-            else{
-                throw std::runtime_error("Wrong number of nodes in element!");
-            }
-			Vector3d X_IP; X_IP.setZero();
-			for(int nodej=0;nodej<elem_size;nodej++){
-			    //std::cout<<R[nodej]<<"\n";
-                //std::cout<<myMesh.nodes[myMesh.elements[elemi][nodej]]<<"\n";
-				X_IP += R[nodej]*myTissue.node_x[myMesh.elements[elemi][nodej]];
-			}
+        }
+    }
+    std::cout<<"seeded wound: "<<n_wound_nodes<<" nodes, "<<n_wound_ip
+             <<" integration points  (centre y="<<y_center<<" z="<<z_center
+             <<", radius "<<r_wound<<" mm)\n";
+    if(n_wound_nodes == 0 || n_wound_ip == 0)
+        std::cout<<"  *** WARNING: wound region is empty - check the mesh and centre ***\n";
 
-            // test inside cylinder segment:
-            double r2 = (X_IP(1) - y_center)*(X_IP(1) - y_center) + (X_IP(2)- z_center)*(X_IP(2) - z_center);
+    reportState(myTissue, IP, "wound seeded, before healing solve");
+    {
+        std::string f1 = out_prefix + "_WOUNDCHECK.vtk";
+        std::string f2 = out_prefix + "_second_WOUNDCHECK.vtk";
+        writeParaview(myTissue, f1.c_str(), f2.c_str());
+    }
 
-            bool inside_cyl = (X_IP(0) >= Xmin_wound && X_IP(0) <= Xmax_wound) && (r2 <= (r_wound+ tol_boundary)*(r_wound+ tol_boundary));
+    double t_heal = env_dbl("WOUND_TFINAL", (7*24*4)+1);
+    myTissue.time = 0.0;
+    myTissue.time_final = t_heal;
+    std::string f = out_prefix + "_heal_";
+    std::cout<<"\n#### PHASE 2: healing for "<<t_heal<<" h ####\n";
+    sparseWoundSolver(myTissue, f, 5, save_node, save_ip);
+    reportState(myTissue, IP, "after healing");
 
-            if(inside_cyl){
-                if(verbose) std::cout<<"IP node: "<<IP_size*elemi+ip<<"\n";
-				Eigen::Vector3d a0,s0,n0;
-				build_cylinder_frame(X_IP, a0_wound , 0.0, 0.0, a0, s0, n0);
-				myTissue.ip_phif_0[elemi*IP_size+ip] = phif0_wound;	
-				myTissue.ip_phif[elemi*IP_size+ip] = phif0_wound;	
-				myTissue.ip_a0_0[elemi*IP_size+ip] = a0;
-				myTissue.ip_a0[elemi*IP_size+ip] = a0;
-				myTissue.ip_s0_0[elemi*IP_size+ip] = s0;
-				myTissue.ip_s0[elemi*IP_size+ip] = s0;
-				myTissue.ip_n0_0[elemi*IP_size+ip] = n0;
-				myTissue.ip_n0[elemi*IP_size+ip] = n0;
-				myTissue.ip_kappa_0[elemi*IP_size+ip] = kappa0_wound;
-				myTissue.ip_kappa[elemi*IP_size+ip] = kappa0_wound;	
-				myTissue.ip_lamdaP_0[elemi*IP_size+ip] = lamda0_wound;
-				myTissue.ip_lamdaP[elemi*IP_size+ip] = lamda0_wound;
-				myTissue.ip_lamdaE[elemi*IP_size+ip] = lamda0_wound;
-				// std::vector<Matrix3d> ip_strain(myMesh.n_elements*IP_size,Matrix3d::Identity(3,3));
-				// std::vector<Matrix3d> ip_stress(myMesh.n_elements*IP_size,Matrix3d::Zero(3,3));
-				// myTissue.ip_strain = ; // what should be this
-				// myTissue.ip_stress = ; // what should be this
-
-                // ip_phi0[elemi*IP_size+ip] = phif0_wound;
-                // ip_a00[elemi*IP_size+ip] = a0_wound;
-                // ip_s00[elemi*IP_size+ip] = s0_wound;
-                // ip_n00[elemi*IP_size+ip] = n0_wound;
-                // ip_kappa0[elemi*IP_size+ip] = kappa0_wound;
-                // ip_lamda0[elemi*IP_size+ip] = lamda0_wound;
-                
-            }
-            
-            //-----------------//
-
-		}
-	}
-	// for now we will only solve for single wound for testing.
-	// // // check the bc and wound initial conditions
-    // // tag = "REF_BC";
-
-    // // filename_step  = "wound_2_20t_output_" + tag + ".vtk"; // CHANGE
-    // // filename_step2 = "wound_2_20t_output_second_" + tag + ".vtk"; // CHANGE
-
-    // // writeParaview(myTissue,
-    // //           filename_step.c_str(),
-    // //           filename_step2.c_str());
-	// myTissue.time_final = (7*24*4)+1; // in hours 
-	// save_node.clear();
-	// save_ip.clear();
-	// std::stringstream ss2;
-	// std::string filename2 = "wound_2_20t_4w_output"+ss2.str()+"_"; // CHANGE
-	// sparseWoundSolver(myTissue, filename2, 5,save_node,save_ip);
-	return 0;	
+    return 0;
 }
