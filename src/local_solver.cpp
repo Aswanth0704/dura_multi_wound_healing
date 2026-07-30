@@ -458,7 +458,11 @@ void localWoundProblemExplicit(
             } else if(lamdaE_a > uplim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
                 dThetadCC(30+II) += (local_dt/tau_lamdaP_a)*((dphifdotplusdCC(ii,jj)*(lamdaE_a-uplim)) + (phif_dot_plus*(dlamdaE_a_dCC(ii,jj))));
             } else{
-                dThetadCC(30+II) = 0;
+            // Inside the deadband this subcycle contributes nothing to the
+            // derivative. It must NOT be zeroed: dTheta* is accumulated with
+            // += across all time_step_ratio subcycles, so assigning 0 here
+            // erased every earlier contribution. With the widened deadband
+            // most subcycles take this branch, so the wipe dominated.
             }
             // lamdaP_s
             if(lamdaE_s < lowlim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
@@ -466,7 +470,11 @@ void localWoundProblemExplicit(
             } else if(lamdaE_s > uplim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
                 dThetadCC(36+II) += (local_dt/tau_lamdaP_s)*((dphifdotplusdCC(ii,jj)*(lamdaE_s-uplim)) + (phif_dot_plus*(dlamdaE_s_dCC(ii,jj))));
             } else{
-                dThetadCC(36+II) = 0;
+            // Inside the deadband this subcycle contributes nothing to the
+            // derivative. It must NOT be zeroed: dTheta* is accumulated with
+            // += across all time_step_ratio subcycles, so assigning 0 here
+            // erased every earlier contribution. With the widened deadband
+            // most subcycles take this branch, so the wipe dominated.
             }
             // lamdaP_n
             if(lamdaE_n < lowlim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
@@ -474,7 +482,11 @@ void localWoundProblemExplicit(
             } else if(lamdaE_n > uplim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
                 dThetadCC(42+II) += (local_dt/tau_lamdaP_n)*((dphifdotplusdCC(ii,jj)*(lamdaE_n-uplim)) + (phif_dot_plus*(dlamdaE_n_dCC(ii,jj))));
             } else{
-                dThetadCC(42+II) = 0;
+            // Inside the deadband this subcycle contributes nothing to the
+            // derivative. It must NOT be zeroed: dTheta* is accumulated with
+            // += across all time_step_ratio subcycles, so assigning 0 here
+            // erased every earlier contribution. With the widened deadband
+            // most subcycles take this branch, so the wipe dominated.
             }
 	    //for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
               //  double z_coord = myMesh.nodes[nodei](2);
@@ -535,7 +547,11 @@ void localWoundProblemExplicit(
         } else if(lamdaE_a > uplim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
             dThetadrho(5) += local_dt*((lamdaE_a-uplim)/tau_lamdaP_a)*dphifdotplusdrho;
         }else{
-            dThetadrho(5) = 0;
+            // Inside the deadband this subcycle contributes nothing to the
+            // derivative. It must NOT be zeroed: dTheta* is accumulated with
+            // += across all time_step_ratio subcycles, so assigning 0 here
+            // erased every earlier contribution. With the widened deadband
+            // most subcycles take this branch, so the wipe dominated.
         }
         // lamdaP_s
         if(lamdaE_s < lowlim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
@@ -543,7 +559,11 @@ void localWoundProblemExplicit(
         } else if(lamdaE_s > uplim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
             dThetadrho(6) += local_dt*((lamdaE_s-uplim)/tau_lamdaP_s)*dphifdotplusdrho;
         } else{
-            dThetadrho(6) = 0;
+            // Inside the deadband this subcycle contributes nothing to the
+            // derivative. It must NOT be zeroed: dTheta* is accumulated with
+            // += across all time_step_ratio subcycles, so assigning 0 here
+            // erased every earlier contribution. With the widened deadband
+            // most subcycles take this branch, so the wipe dominated.
         }
         // lamdaP_n
         if(lamdaE_n < lowlim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
@@ -551,7 +571,11 @@ void localWoundProblemExplicit(
         } else if(lamdaE_n > uplim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
             dThetadrho(7) += local_dt*((lamdaE_n-uplim)/tau_lamdaP_n)*dphifdotplusdrho;
         } else{
-            dThetadrho(7) = 0;
+            // Inside the deadband this subcycle contributes nothing to the
+            // derivative. It must NOT be zeroed: dTheta* is accumulated with
+            // += across all time_step_ratio subcycles, so assigning 0 here
+            // erased every earlier contribution. With the widened deadband
+            // most subcycles take this branch, so the wipe dominated.
         }
 
 
@@ -611,7 +635,11 @@ void localWoundProblemExplicit(
         } else if(lamdaE_a > uplim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
             dThetadc(5) += local_dt*((lamdaE_a-uplim)/tau_lamdaP_a)*dphifdotplusdc;
         } else{
-            dThetadc(5) = 0;
+            // Inside the deadband this subcycle contributes nothing to the
+            // derivative. It must NOT be zeroed: dTheta* is accumulated with
+            // += across all time_step_ratio subcycles, so assigning 0 here
+            // erased every earlier contribution. With the widened deadband
+            // most subcycles take this branch, so the wipe dominated.
         }
         // lamdaP_s
         if(lamdaE_s < lowlim){ // && (lamdaE_s < uplim && lamdaE_s > lowlim)
@@ -619,7 +647,11 @@ void localWoundProblemExplicit(
         } else if(lamdaE_s > uplim){ // && (lamdaE_s < uplim && lamdaE_s > lowlim)
             dThetadc(6) += local_dt*((lamdaE_s-uplim)/tau_lamdaP_s)*dphifdotplusdc;
         } else{
-            dThetadc(6) = 0;
+            // Inside the deadband this subcycle contributes nothing to the
+            // derivative. It must NOT be zeroed: dTheta* is accumulated with
+            // += across all time_step_ratio subcycles, so assigning 0 here
+            // erased every earlier contribution. With the widened deadband
+            // most subcycles take this branch, so the wipe dominated.
         }
         // lamdaP_n
         if(lamdaE_n < lowlim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
@@ -627,7 +659,11 @@ void localWoundProblemExplicit(
         } else if(lamdaE_n > uplim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
             dThetadc(7) += local_dt*((lamdaE_n-uplim)/tau_lamdaP_n)*dphifdotplusdc;
         } else{
-            dThetadc(7) = 0;
+            // Inside the deadband this subcycle contributes nothing to the
+            // derivative. It must NOT be zeroed: dTheta* is accumulated with
+            // += across all time_step_ratio subcycles, so assigning 0 here
+            // erased every earlier contribution. With the widened deadband
+            // most subcycles take this branch, so the wipe dominated.
         }
 
 
