@@ -1,0 +1,38 @@
+# Allow-list strategy: this directory holds ~8.7 GB of meshes, result folders and
+# zip archives alongside ~1 MB of source. Ignore everything at top level, then
+# re-admit only the code and docs. Keeps simulation output and meshes out of git.
+
+/*
+
+!/.gitignore
+!/CMakeLists.txt
+!/CLAUDE.md
+!/plan.md
+!/ToDo.md
+!/src/
+!/include/
+!/scripts/
+!/meshing/
+
+# Junk that can appear inside the admitted directories
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Build artifacts, in case anyone builds in-tree
+build/
+run_*/
+*.o
+*.a
+woundcpp3D
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Simulation output, in case it lands inside an admitted directory
+*.vtk
+*.mphtxt
+*.msh
+*.zip
