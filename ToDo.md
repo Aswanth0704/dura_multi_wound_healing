@@ -34,7 +34,7 @@ branch before any edits.
 
 ---
 
-## Six defects found and fixed that were not in the original plan
+## Seven defects found and fixed that were not in the original plan
 
 These were blocking the healing phase and are worth knowing about.
 
@@ -76,6 +76,15 @@ These were blocking the healing phase and are worth knowing about.
 6. **`myTissue.time` was never initialized** by the driver although both solvers
    read it, making `total_steps = (time_final − time)/time_step` undefined
    behaviour that happened to work.
+
+7. **Unconverged Newton steps were accepted.** When the loop exhausted
+   `max_iter` the solver printed a warning and moved on, keeping a state that was
+   not a solution. Because the transport equations have no positivity limiter,
+   that surfaced as **concentrations down to -1.66** during the puncture
+   snap-open. Found by `scripts/verify_run.py`, not by watching the log. Such a
+   step is now rejected and `dt` halved, which is what the adaptive time stepping
+   existed for — and which only became usable once defect 3 made the rollback
+   restore `node_x`.
 
 Plus **damped-Newton step limiting**: puncturing prestretched dura collapses the
 passive stress in the wound elements (`SSe_pas ∝ phif`, 1 → 0.01) so the hole

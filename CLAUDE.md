@@ -137,7 +137,14 @@ The linear solve does three things that are load-bearing:
 - **Direct factorization primary**, equilibrated iterative as fallback. The direct path does not silently return a garbage increment.
 - **Damped Newton.** Puncturing prestretched dura collapses the passive stress in the wound elements (`SSe_pas ∝ phif`, 1 → 0.01) so the hole snaps open; an undamped step overshot badly. The increment is scaled as a whole, preserving the Newton direction.
 
-Plus a NaN/Inf guard on the assembled system that names the offending dof and field. On divergence the step is rejected and `time_step` halved; the rollback restores `node_x` from a per-step snapshot as well as the `_0` fields.
+- **Unconverged steps are rejected, not accepted.** A step that exhausts
+  `max_iter` with `residuum > tol` sets `reset`, so it is thrown away and `dt` is
+  halved. The old code merely printed "Check, make sure residual is small enough"
+  and kept going — which is what produced concentrations as low as **-1.66**
+  during the puncture snap-open, since the transport equations have no positivity
+  limiter and an unconverged increment surfaces directly as negative species.
+
+Plus a NaN/Inf guard on the assembled system that names the offending dof and field, and a per-step negative-species report. On divergence the step is rejected and `time_step` halved; the rollback restores `node_x` from a per-step snapshot as well as the `_0` fields. There is deliberately **no clamping** of concentrations — clamping would hide a convergence failure rather than fix one.
 
 **Tet quadrature is 4-point (Keast), not 1-point.** One centroid point makes all four linear shape functions equal 1/4, so the element mass/reaction matrix is rank 1, leaving three near-null modes per element. Uniform fields never excite them — which is why settling always looked fine — but a wound gradient does: Newton asked for concentration increments of ~124 while the residual stayed small. The 4-point rule is degree 2, exact for the linear-tet mass matrix.
 
