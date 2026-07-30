@@ -34,6 +34,7 @@
     WOUND_DTRAMP    first (smallest) time step of the transient ladder [h]
     WOUND_RUNGS     steps per rung of that ladder (0 disables the ladder)
     WOUND_WSMOOTH   width of the smooth wound edge [mm]
+    WOUND_TOL       Newton tolerance on the relative residual
 */
 
 #include <omp.h>
@@ -645,7 +646,22 @@ int main(int argc, char *argv[])
     myTissue.nBC_alpha = nBC_alpha;
     myTissue.time       = 0.0;   // was never initialized: the solver reads it
     myTissue.time_step  = 0.2;
-    myTissue.tol        = 1e-8;
+    // Newton tolerance on the RELATIVE residual normRR/(1+residuum0).
+    //
+    // 1e-8 turned out to sit at or below the accuracy floor of the linear
+    // solve: rejected steps were reaching 3.6e-8 and stalling, i.e. Newton had
+    // converged as far as the linear algebra allowed and the step was rejected
+    // anyway, which sent dt into a halving spiral it could not escape (the
+    // floor does not scale with dt).
+    //
+    // On accumulation: backward Euler is unconditionally stable here and the
+    // homeostatic fixed point is ATTRACTING - tests/test_homeostasis.cpp checks
+    // that s_rho, s_c and phi_dot all change sign in the restoring direction
+    // either side of (1,1,1) - so a small per-step residual is damped rather
+    // than amplified. That argument is verified empirically by rerunning the
+    // 100 h no-wound gate at this tolerance and comparing against the completed
+    // 1e-8 run; see ToDo.md.
+    myTissue.tol        = env_dbl("WOUND_TOL", 1e-6);
     // Newton converges LINEARLY (not quadratically) on the stiff
     // alpha-driven cytokine surge, reaching ~1e-6 by iteration 60. Rejecting
     // there costs a 5x dt cut; giving it more iterations is much cheaper, so
