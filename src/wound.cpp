@@ -21,6 +21,40 @@ This code is the implementation of the DaLaWoHe
 using namespace Eigen;
 
 //--------------------------------------------------------//
+// FIBROBLAST DIFFUSIVITY  D_rho(phif)
+//--------------------------------------------------------//
+//
+// Single definition, used by evalWound, evalFluxesSources, evalQ and evalBC.
+// NOTE: global_parameters[7] is the legacy D_rhorho slot and is NOT read -
+// the diffusivity is defined entirely here.
+//
+//   Ppoly(x) = A x^5 + B x^4 + C x^3 + D x^2 + E x       (Ppoly(0)=Ppoly(1)=0)
+//   C_up     = 1 - 1/(1+exp(-500 (phi-1)))   upper shutoff at healthy collagen
+//   D_rho    = KD * (1e-3 Ppoly(phi - phif00))^2 / 6 * C_up
+//
+// The polynomial is evaluated at (phi - phif00), so it also vanishes at
+// phi = phif00, which is how the low-collagen cutoff is presently achieved.
+//
+static inline double evalDrho(double phif, double c)
+{
+    (void)c; // no chemotactic dependence in this form
+
+    const double KD  =  1582.3;
+    const double A   =   182.01;
+    const double B   =  -655.0;
+    const double C   =   875.66;
+    const double D   =  -521.57;
+    const double E   =   118.9;
+    const double phif00 = 1e-2;
+
+    const double x     = phif - phif00;
+    const double Ppoly = A*pow(x,5) + B*pow(x,4) + C*pow(x,3) + D*pow(x,2) + E*x;
+    const double C_up  = 1.0 - (1.0/(1.0 + exp(-500.0*(phif - 1.0))));
+
+    return KD*(pow(Ppoly*0.001, 2)/6.0)*C_up;
+}
+
+//--------------------------------------------------------//
 // RESIDUAL AND TANGENT
 //--------------------------------------------------------//
 
@@ -534,15 +568,7 @@ void evalWound(
         double Psivol = 0.5*phif*pow(penalty*(Je-1.),2) - 2*phif*k0*log(Je); //*phif
         double dPsivoldJe = phif*penalty*(Je-1.) - 2*phif*k0/Je;
         double dPsivoldJedJe = phif*penalty + 2*phif*k0/(Je*Je);
-	double eq_const = 1582.3;
-	double eq_a = 182.01;
-	double eq_b = -655;
-	double eq_c = 875.66;
-	double eq_d = -521.57;
-	double eq_e = 118.9;
-    double phif00 = 1e-2;
-    double D_rhorho = eq_const*((pow((((eq_a*pow(phif-phif00,5)) + (eq_b*pow(phif-phif00,4)) + (eq_c*pow(phif-phif00,3)) + (eq_d*pow(phif-phif00,2)) + (eq_e*(phif-phif00)))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1)))));
-	// double D_rhorho = eq_const*((pow((((eq_a*pow(phif,5)) + (eq_b*pow(phif,4)) + (eq_c*pow(phif,3)) + (eq_d*pow(phif,2)) + (eq_e*phif))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1))))) + 6.12E-5 + (0.00612*(c/(1E-5+c)));
+    double D_rhorho = evalDrho(phif, c);
         Matrix3d SSe_vol = dPsivoldJe*Je*CCeinv/2; // = phif*penalty*Je*(Je-1.)*CCeinv/2 - phif*k0*CCeinv;
         Matrix3d SS_vol = Jp*FFginv*SSe_vol*FFginv;
 
@@ -1189,15 +1215,7 @@ void evalFluxesSources(const std::vector<double> &global_parameters, const doubl
     double t_rho_c = global_parameters[4]; // force of myofibroblasts enhanced by chemical
     double K_t = global_parameters[5]; // saturation of collagen on force
     double K_t_c = global_parameters[6]; // saturation of chemical on force
-    double eq_const = 1582.3;
-    double eq_a = 182.01;
-    double eq_b = -655;
-    double eq_c = 875.66;
-    double eq_d = -521.57;
-    double eq_e = 118.9;
-    double phif00 = 1e-2;
-    double D_rhorho = eq_const*((pow((((eq_a*pow(phif-phif00,5)) + (eq_b*pow(phif-phif00,4)) + (eq_c*pow(phif-phif00,3)) + (eq_d*pow(phif-phif00,2)) + (eq_e*(phif-phif00)))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1)))));
-    // double D_rhorho = eq_const*((pow((((eq_a*pow(phif,5)) + (eq_b*pow(phif,4)) + (eq_c*pow(phif,3)) + (eq_d*pow(phif,2)) + (eq_e*phif))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1))))) + 6.12E-5 + (0.00612*(c/(1E-5+c)));
+    double D_rhorho = evalDrho(phif, c);
     double D_rhoc = global_parameters[8]; // diffusion of chemotactic gradient
     double D_cc = global_parameters[9]; // diffusion of chemical
     double p_rho =global_parameters[10]; // production of fibroblasts naturally
@@ -1580,15 +1598,7 @@ void evalQ(const std::vector<double> &global_parameters, const double& phif,Vect
     // calculate the structure tensor
     Matrix3d A0 = kappa*Identity + (1-3.*kappa)*a0a0;
     double trA = kappa*(CC(0,0)+CC(1,1)+CC(2,2)) + (1-3*kappa)*I4tot;
-    double eq_const = 1582.3;
-    double eq_a = 182.01;
-    double eq_b = -655;
-    double eq_c = 875.66;
-    double eq_d = -521.57;
-    double eq_e = 118.9;
-    double phif00 = 1e-2;
-    double D_rhorho = eq_const*((pow((((eq_a*pow(phif-phif00,5)) + (eq_b*pow(phif-phif00,4)) + (eq_c*pow(phif-phif00,3)) + (eq_d*pow(phif-phif00,2)) + (eq_e*(phif-phif00)))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1)))));
-    // double D_rhorho = eq_const*((pow((((eq_a*pow(phif,5)) + (eq_b*pow(phif,4)) + (eq_c*pow(phif,3)) + (eq_d*pow(phif,2)) + (eq_e*phif))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1))))) + 6.12E-5 + (0.00612*(c/(1E-5+c)));
+    double D_rhorho = evalDrho(phif, c);
     // Flux and Source terms for the rho and the C
     Q_rho = -D_rhorho*CCinv*Grad_rho - D_rhoc*CCinv*Grad_c;
     //Q_rho = -3*(D_rhorho-phif*(D_rhorho-D_rhorho/10))*A0*Grad_rho/trA - 3*(D_rhoc-phif*(D_rhoc-D_rhoc/10))*rho*A0*Grad_c/trA;
@@ -2215,15 +2225,7 @@ void evalBC(int surface_boundary_flag, const std::vector<double> &ip_Jac, const 
 
         Vector3d traction = Vector3d(0,0,0);
         double spring = -1e-4;
-	double eq_const = 1582.3;
-	double eq_a = 182.01;
-	double eq_b = -655;
-	double eq_c = 875.66;
-	double eq_d = -521.57;
-	double eq_e = 118.9;
-    double phif00 = 1e-2;
-    double D_rhorho = eq_const*((pow((((eq_a*pow(phif-phif00,5)) + (eq_b*pow(phif-phif00,4)) + (eq_c*pow(phif-phif00,3)) + (eq_d*pow(phif-phif00,2)) + (eq_e*(phif-phif00)))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1)))));
-	// double D_rhorho = eq_const*((pow((((eq_a*pow(phif,5)) + (eq_b*pow(phif,4)) + (eq_c*pow(phif,3)) + (eq_d*pow(phif,2)) + (eq_e*phif))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1))))) + 6.12E-5 + (0.00612*(c/(1E-5+c)));
+    double D_rhorho = evalDrho(phif, c);
         double k_rho_0 = -D_rhorho/10;
         double k_rho = (k_rho_0-phif*(k_rho_0-k_rho_0/10)); // -3.0*(D_rhorho-phif*(D_rhorho-D_rhorho/10))*A0*Grad_rho/trA - 3*(D_rhoc-phif*(D_rhoc-D_rhoc/10))*rho*A0*Grad_c/trA;
         double d_k_rho_dphif = (k_rho_0-k_rho_0/10);

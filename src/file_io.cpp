@@ -561,8 +561,15 @@ void writeTissue(tissue &myTissue, const char* filename,double time)
 	savefile<<myTissue.n_vol_elem<<"\n";
 	savefile<<myTissue.n_IP<<"\n";
 	savefile<<myTissue.n_dof<<"\n";
+	// Write however many nodes the element actually has. This used to be
+	// hard-coded to 8, which read past the end of 4-node tet connectivity and
+	// emitted uninitialized memory (differing between runs of the same binary).
 	for(int i=0;i<myTissue.vol_elem_connectivity.size();i++){
-		savefile<<myTissue.vol_elem_connectivity[i][0]<<" "<<myTissue.vol_elem_connectivity[i][1]<<" "<<myTissue.vol_elem_connectivity[i][2]<<" "<<myTissue.vol_elem_connectivity[i][3]<<" "<<myTissue.vol_elem_connectivity[i][4]<<" "<<myTissue.vol_elem_connectivity[i][5]<<" "<<myTissue.vol_elem_connectivity[i][6]<<" "<<myTissue.vol_elem_connectivity[i][7]<<"\n";
+		for(int j=0;j<myTissue.vol_elem_connectivity[i].size();j++){
+			savefile<<myTissue.vol_elem_connectivity[i][j];
+			if(j+1<myTissue.vol_elem_connectivity[i].size()) savefile<<" ";
+		}
+		savefile<<"\n";
 	}
 	for(int i=0;i<myTissue.boundaryNodes.size();i++){
 		savefile<<myTissue.boundaryNodes[i]<<"\n";
@@ -585,8 +592,9 @@ void writeTissue(tissue &myTissue, const char* filename,double time)
 	for(int i=0;i<myTissue.ip_kappa_0.size();i++){
 		savefile<<myTissue.ip_kappa_0[i]<<"\n";
 	}	
+	// All three components (this used to drop the through-thickness one).
 	for(int i=0;i<myTissue.ip_lamdaP_0.size();i++){
-		savefile<<myTissue.ip_lamdaP_0[i](0)<<" "<<myTissue.ip_lamdaP_0[i](1)<<"\n";
+		savefile<<myTissue.ip_lamdaP_0[i](0)<<" "<<myTissue.ip_lamdaP_0[i](1)<<" "<<myTissue.ip_lamdaP_0[i](2)<<"\n";
 	}
 	for(int i=0;i<myTissue.node_x.size();i++){
 		savefile<<myTissue.node_x[i](0)<<" "<<myTissue.node_x[i](1)<<" "<<myTissue.node_x[i](2)<<"\n";

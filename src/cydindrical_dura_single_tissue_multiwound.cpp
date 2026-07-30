@@ -17,6 +17,9 @@ Solve.
 #include <iostream>
 #include <fstream>
 #include <cmath>
+#include <cstdlib>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <ctime>
 #include <vector>
@@ -85,6 +88,21 @@ int main(int argc, char *argv[])
     Eigen::initParallel();
 	std::cout<<"\nRunning full domain simulations with " << Eigen::nbThreads( ) << " threads.\n";
 	srand (time(NULL));
+
+	// Verbose diagnostics (full node/element/jacobian/dof dumps) are off by
+	// default: on a fine mesh they emit gigabytes of stdout. Turn on with
+	// WOUND_VERBOSE=1 in the environment.
+	const bool verbose = (std::getenv("WOUND_VERBOSE") != nullptr);
+
+	// Small helpers so verification runs can be steered without recompiling.
+	auto env_str = [](const char* key, const std::string& fallback){
+		const char* v = std::getenv(key);
+		return (v && *v) ? std::string(v) : fallback;
+	};
+	auto env_dbl = [](const char* key, double fallback){
+		const char* v = std::getenv(key);
+		return (v && *v) ? std::atof(v) : fallback;
+	};
 
 	// for normalization
 	double rho_phys = 1000*55.05126; // [cells/mm^3]
@@ -242,7 +260,8 @@ int main(int argc, char *argv[])
     double Zmax = 10.0;
 	std::vector<double> hexDimensions = {Xmin, Xmax, Ymin, Ymax, Zmin, Zmax};
 	std::vector<int> meshResolution =  {16,16,6};
-    std::string mesh_filename = "dura_cyl_repeated_wound_v62_20t_finer.mphtxt"; // CHANGE
+    std::string mesh_filename = env_str("WOUND_MESH", "dura_cyl_repeated_wound_v62_20t_finer.mphtxt"); // CHANGE
+    std::cout<<"mesh file: "<<mesh_filename<<"\n";
     HexMesh myMesh = readCOMSOLInput(mesh_filename, hexDimensions, meshResolution);
 
     // Other possibles meshes:
@@ -256,24 +275,28 @@ int main(int argc, char *argv[])
 
     std::cout<<"Created the mesh with "<<myMesh.n_nodes<<" nodes and "<<myMesh.boundary_flag.size()<<" boundaries and "<<myMesh.n_elements<<" elements\n";
     std::cout<<"Created the surface mesh with "<<myMesh.n_nodes<<" nodes and "<<myMesh.surface_boundary_flag.size()<<" boundaries and "<<myMesh.n_surf_elements<<" elements\n";
-	// print the mesh
-	// prints x, y, z coordinates
-	std::cout<<"nodes\n";
-	for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
-		std::cout<<myMesh.nodes[nodei](0)<<","<<myMesh.nodes[nodei](1)<<","<<myMesh.nodes[nodei](2)<<"\n";
-	}
-	// prints nodes associated with each element
-	std::cout<<"elements\n";
-    for(int elemi=0;elemi<myMesh.n_elements;elemi++){
-        for(int nodei=0;nodei<myMesh.elements[elemi].size();nodei++){
-            std::cout<<myMesh.elements[elemi][nodei]<<" ";
-        }
-        std::cout<<"\n";
-    }
-	// prints boundary
-	std::cout<<"boundary\n";
-	for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
-		std::cout<<myMesh.boundary_flag[nodei]<<"\n";
+	// Dump the full mesh only when asked. On a fine mesh these loops emit
+	// gigabytes of stdout, which dominates the runtime of a production job.
+	// Enable with:  WOUND_VERBOSE=1 ./woundcpp3D
+	if(verbose){
+		// prints x, y, z coordinates
+		std::cout<<"nodes\n";
+		for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
+			std::cout<<myMesh.nodes[nodei](0)<<","<<myMesh.nodes[nodei](1)<<","<<myMesh.nodes[nodei](2)<<"\n";
+		}
+		// prints nodes associated with each element
+		std::cout<<"elements\n";
+		for(int elemi=0;elemi<myMesh.n_elements;elemi++){
+			for(int nodei=0;nodei<myMesh.elements[elemi].size();nodei++){
+				std::cout<<myMesh.elements[elemi][nodei]<<" ";
+			}
+			std::cout<<"\n";
+		}
+		// prints boundary
+		std::cout<<"boundary\n";
+		for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
+			std::cout<<myMesh.boundary_flag[nodei]<<"\n";
+		}
 	}
 	// create the other fields needed in the tissue struct.
 	int elem_size = myMesh.elements[0].size();
@@ -329,7 +352,7 @@ int main(int argc, char *argv[])
 		if(myMesh.boundary_flag[nodei] == 1){ 
 
 			// insert the boundary condition for displacement
-			std::cout<<"fixing node "<<nodei<<"\n";
+			if(verbose) std::cout<<"fixing node "<<nodei<<"\n";
 			eBC_x.insert ( std::pair<int,double>(nodei*3+0,myMesh.nodes[nodei](0)) ); // x coordinate
 			eBC_x.insert ( std::pair<int,double>(nodei*3+1,myMesh.nodes[nodei](1)) ); // y coordinate
 			eBC_x.insert ( std::pair<int,double>(nodei*3+2,myMesh.nodes[nodei](2)) ); // z coordinate
@@ -346,7 +369,7 @@ int main(int argc, char *argv[])
         bool inside_cyl = (x_coord >= Xmin_wound && x_coord <= Xmax_wound) && (r2 <= (r_wound+ tol_boundary)*(r_wound+ tol_boundary));
 
         if(inside_cyl){
-            std::cout << "wound node " << nodei << "\n";
+            if(verbose) std::cout << "wound node " << nodei << "\n";
             node_rho0[nodei] = rho_wound;
             node_c0[nodei]   = c_wound;
         }
@@ -392,7 +415,7 @@ int main(int argc, char *argv[])
             bool inside_cyl = (X_IP(0) >= Xmin_wound && X_IP(0) <= Xmax_wound) && (r2 <= (r_wound+ tol_boundary)*(r_wound+ tol_boundary));
 
             if(inside_cyl){
-                std::cout<<"IP node: "<<IP_size*elemi+ip<<"\n";
+                if(verbose) std::cout<<"IP node: "<<IP_size*elemi+ip<<"\n";
 				// update the wound geometry with orientations:
 				Eigen::Vector3d a0,s0,n0;
 				build_cylinder_frame(X_IP, a0_wound , 0.0, 0.0, a0, s0, n0);
@@ -461,7 +484,7 @@ int main(int argc, char *argv[])
 	myTissue.nBC_x = nBC_x;
 	myTissue.nBC_rho = nBC_rho;
 	myTissue.nBC_c = nBC_c;
-	myTissue.time_final = (7*24*4)+1; // CHANGE
+	myTissue.time_final = env_dbl("WOUND_TFINAL", (7*24*4)+1); // CHANGE
 	myTissue.time_step = 0.2;
 	myTissue.tol = 1e-8;
 	myTissue.max_iter = 25;
@@ -478,24 +501,25 @@ int main(int argc, char *argv[])
     //evalElemJacobiansSurface(myTissue);
 	//
 	//print out the Jacobians
-	std::cout<<"element jacobians\nJacobians= ";
-	std::cout<<myTissue.elem_jac_IP.size()<<"\n";
-	for(int i=0;i<myTissue.elem_jac_IP.size();i++){
-		std::cout<<"element: "<<i<<"\n";
-		for(int j=0;j<IP_size;j++){
-			std::cout<<"ip; "<<j<<"\n"<<myTissue.elem_jac_IP[i][j]<<"\n";
-		}
-	}
-	// print out the forward dof map
+	std::cout<<"element jacobians: "<<myTissue.elem_jac_IP.size()<<"\n";
 	std::cout<<"Total :"<<myTissue.n_dof<<" dof\n";
-	for(int i=0;i<myTissue.dof_fwd_map_x.size();i++){
-		std::cout<<"x node*3+coord: "<<i<<", dof: "<<myTissue.dof_fwd_map_x[i]<<"\n";
-	}
-	for(int i=0;i<myTissue.dof_fwd_map_rho.size();i++){
-		std::cout<<"rho node: "<<i<<", dof: "<<myTissue.dof_fwd_map_rho[i]<<"\n";
-	}
-	for(int i=0;i<myTissue.dof_fwd_map_c.size();i++){
-		std::cout<<"c node: "<<i<<", dof: "<<myTissue.dof_fwd_map_c[i]<<"\n";
+	if(verbose){
+		for(int i=0;i<myTissue.elem_jac_IP.size();i++){
+			std::cout<<"element: "<<i<<"\n";
+			for(int j=0;j<IP_size;j++){
+				std::cout<<"ip; "<<j<<"\n"<<myTissue.elem_jac_IP[i][j]<<"\n";
+			}
+		}
+		// print out the forward dof map
+		for(int i=0;i<myTissue.dof_fwd_map_x.size();i++){
+			std::cout<<"x node*3+coord: "<<i<<", dof: "<<myTissue.dof_fwd_map_x[i]<<"\n";
+		}
+		for(int i=0;i<myTissue.dof_fwd_map_rho.size();i++){
+			std::cout<<"rho node: "<<i<<", dof: "<<myTissue.dof_fwd_map_rho[i]<<"\n";
+		}
+		for(int i=0;i<myTissue.dof_fwd_map_c.size();i++){
+			std::cout<<"c node: "<<i<<", dof: "<<myTissue.dof_fwd_map_c[i]<<"\n";
+		}
 	}
 	//
 	// 
@@ -505,7 +529,7 @@ int main(int argc, char *argv[])
 	std::vector<int> save_ip;save_ip.clear();
 
 	std::stringstream ss;
-	std::string filename = "wound_1_20t_4w_output"+ss.str()+"_"; // CHANGE
+	std::string filename = env_str("WOUND_OUT", "wound_1_20t_4w_output")+ss.str()+"_"; // CHANGE
 
     // check the bc and wound initial conditions
     // std::string tag = "REF_BC";
@@ -538,7 +562,7 @@ int main(int argc, char *argv[])
         bool inside_cyl = (x_coord >= Xmin_wound && x_coord <= Xmax_wound) && (r2 <= (r_wound+ tol_boundary)*(r_wound+ tol_boundary));
 
         if(inside_cyl){
-            std::cout << "wound node " << nodei << "\n";
+            if(verbose) std::cout << "wound node " << nodei << "\n";
 			myTissue.node_rho_0[nodei] = rho_wound;
 			myTissue.node_rho[nodei] = rho_wound;
 			myTissue.node_c_0[nodei] = c_wound;
@@ -586,7 +610,7 @@ int main(int argc, char *argv[])
             bool inside_cyl = (X_IP(0) >= Xmin_wound && X_IP(0) <= Xmax_wound) && (r2 <= (r_wound+ tol_boundary)*(r_wound+ tol_boundary));
 
             if(inside_cyl){
-                std::cout<<"IP node: "<<IP_size*elemi+ip<<"\n";
+                if(verbose) std::cout<<"IP node: "<<IP_size*elemi+ip<<"\n";
 				Eigen::Vector3d a0,s0,n0;
 				build_cylinder_frame(X_IP, a0_wound , 0.0, 0.0, a0, s0, n0);
 				myTissue.ip_phif_0[elemi*IP_size+ip] = phif0_wound;	
