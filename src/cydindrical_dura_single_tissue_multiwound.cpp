@@ -36,6 +36,7 @@
     WOUND_WSMOOTH   width of the smooth wound edge [mm]
     WOUND_TOL       Newton tolerance on the relative residual
     WOUND_TOL_INC   Newton tolerance on the increment norm (limit-cycle escape)
+    WOUND_TRHO      active traction t_rho [MPa]; t_rho_c follows at 3.28571x
 */
 
 #include <omp.h>
@@ -303,8 +304,14 @@ int main(int argc, char *argv[])
     // so with rho normalized to 1 these must absorb the old rho_phys factor:
     // the previous value 1.28571e-6/55.05126 multiplied by rho_phys = 55051.26
     // is 1.28571e-3, i.e. this conversion is traction-PRESERVING.
-    double t_rho   = 1.28571e-3;              // [MPa] at rho = rho_h
-    double t_rho_c = 1.28571e-3*3.28571;      // enhancement by cytokine
+    //
+    // Overridable so a traction sweep needs no rebuild. Active traction is the
+    // stiffest coupling in the system - it feeds the mechanics block through
+    // rho and c, so it is the first suspect whenever Newton struggles. Scale
+    // both together with WOUND_TRHO; t_rho_c keeps its 3.28571 ratio to t_rho.
+    double t_rho   = env_dbl("WOUND_TRHO", 1.28571e-3);  // [MPa] at rho = rho_h
+    double t_rho_c = t_rho*3.28571;                      // enhancement by cytokine
+    std::cout<<"active traction: t_rho="<<t_rho<<" t_rho_c="<<t_rho_c<<" MPa\n";
     double K_t     = 0.2;                     // saturation of traction by collagen
     double K_t_c   = c_h/10.0;                // saturation of traction by cytokine
 
