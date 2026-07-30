@@ -137,6 +137,16 @@ inside an `omp critical`, so scaling saturates (observed 350–530% of 1200%).
   Recommend a Laplace problem at mesh-read time (inner surface 0, outer 1),
   `n0 = ∇u/‖∇u‖`. Avoid the eigenvalue-based alternative — non-smooth at
   crossings, which would damage the tangent.
+- **A small residual φ drift is expected, and is discretization, not a bug.**
+  The derived parameters make (0,1,1,1) an exact fixed point only where
+  H = 1/2, i.e. where θ^e = ϑ^e = 1.136 exactly. Discretizing the curved shell
+  gives θ^e ∈ [1.1254, 1.1462], so H ∈ [0.4736, 0.5256], and the fixed point is
+  displaced in proportion to |H − 1/2|. The leading term is
+  `dφ/dt ≈ p_phi_theta·(H−1/2)·ρ/(K_φρ+φ)`, which for |H−1/2| ~ 0.008 predicts
+  ~6e-4 over 28 h — matching the observed local drift, and ~1e-2 over 4 weeks.
+  Far-field drift is ~10x smaller. If this matters for a long run, refine the
+  mesh through the thickness (it shrinks the θ^e spread) rather than retuning
+  parameters.
 - **`tau_lamdaP_*` are not co-scaled** with `K_phi_rho` (unlike
   `tau_omega`/`tau_kappa`), so plastic growth rate moves with any
   renormalization.
