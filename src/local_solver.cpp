@@ -334,12 +334,24 @@ void localWoundProblemExplicit(
             }
         }
 
+        // Chain rule from CCe back to CC.  CCe = Fg^-1 CC Fg^-1 with Fg^-1
+        // symmetric, so
+        //     dCCe_ij/dCC_kl = Fginv_ik Fginv_lj
+        // and  df/dCC_kl = sum_ij (df/dCCe_ij) Fginv_ik Fginv_lj.
+        //
+        // This used to ASSIGN rather than accumulate over (ii,jj) - so only the
+        // last term, (ii,jj) = (2,2), survived out of nine - and it paired the
+        // indices as Fginv(ii,jj)*Fginv(kk,ll), which is not the chain rule at
+        // all. These derivatives feed dThetadCC and hence Ke_x_x, Ke_rho_x and
+        // Ke_c_x, so the global tangent was wrong wherever the fiber frame
+        // rotates: Newton converged linearly instead of quadratically, grinding
+        // past 200 iterations on stiff steps.
         for (int ii=0; ii<3; ii++){
             for (int jj=0; jj<3; jj++) {
                 for (int kk=0; kk<3; kk++){
                     for (int ll=0; ll<3; ll++) {
                         for (int mm=0; mm<3; mm++) {
-                            dvectormaxdCC[mm](kk,ll) = dvectormaxdCCe[mm](ii,jj)*(FFginv(ii,jj)*FFginv(kk,ll));
+                            dvectormaxdCC[mm](kk,ll) += dvectormaxdCCe[mm](ii,jj)*FFginv(ii,kk)*FFginv(ll,jj);
                         }
                     }
                 }
@@ -359,9 +371,10 @@ void localWoundProblemExplicit(
             for (int jj=0; jj<3; jj++) {
                 for (int kk=0; kk<3; kk++){
                     for (int ll=0; ll<3; ll++) {
-                        dlamdamaxdCC(kk,ll) = dlamdamaxdCCe(ii,jj)*(FFginv(ii,jj)*FFginv(kk,ll));
-                        dlamdameddCC(kk,ll) = dlamdameddCCe(ii,jj)*(FFginv(ii,jj)*FFginv(kk,ll));
-                        dlamdamindCC(kk,ll) = dlamdamindCCe(ii,jj)*(FFginv(ii,jj)*FFginv(kk,ll));
+                        // same correction as for dvectormaxdCC above
+                        dlamdamaxdCC(kk,ll) += dlamdamaxdCCe(ii,jj)*FFginv(ii,kk)*FFginv(ll,jj);
+                        dlamdameddCC(kk,ll) += dlamdameddCCe(ii,jj)*FFginv(ii,kk)*FFginv(ll,jj);
+                        dlamdamindCC(kk,ll) += dlamdamindCCe(ii,jj)*FFginv(ii,kk)*FFginv(ll,jj);
                     }
                 }
             }
