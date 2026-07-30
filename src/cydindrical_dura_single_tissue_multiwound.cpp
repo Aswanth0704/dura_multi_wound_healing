@@ -28,6 +28,9 @@
     WOUND_PATCH     free-patch radius / r_wound (default 4)
     WOUND_NOWOUND   set to skip phase 2 (homeostasis test only)
     WOUND_VERBOSE   full node/element/dof dumps
+    WOUND_ALPHA_D     D_alpha   [mm^2/h]  (0 decouples alpha spatially)
+    WOUND_ALPHA_DECAY d_alpha   [1/h]
+    WOUND_ALPHA_PC    p_c_alpha [1/h]     (0 decouples alpha from cytokine)
 */
 
 #include <omp.h>
@@ -323,9 +326,13 @@ int main(int argc, char *argv[])
     // APPENDED at indices 25/26/27: wound.cpp unpacks global_parameters by
     // literal index at six separate sites, so inserting mid-vector would
     // silently corrupt every downstream read.
-    double D_alpha   = 0.00930;   // [mm^2/h] taken equal to D_c
-    double d_alpha   = 0.0128;    // [1/h] decay
-    double p_c_alpha = 0.208;     // [1/h] cytokine production driven by alpha
+    // Overridable so the alpha equation can be validated in isolation: with
+    // WOUND_ALPHA_D=0 and WOUND_ALPHA_PC=0 the field decouples completely and
+    // must follow alpha(t) = alpha_0 exp(-d_alpha t) exactly at every node,
+    // which tests the alpha residual and tangent against a closed form.
+    double D_alpha   = env_dbl("WOUND_ALPHA_D",     0.00930); // [mm^2/h] = D_c
+    double d_alpha   = env_dbl("WOUND_ALPHA_DECAY", 0.0128);  // [1/h]
+    double p_c_alpha = env_dbl("WOUND_ALPHA_PC",    0.208);   // [1/h]
 
     //=======================================================================//
     // LOCAL PARAMETERS
