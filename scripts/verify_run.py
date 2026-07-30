@@ -78,14 +78,32 @@ def read_vtk(path):
     return pts, fields
 
 
-def masks(pts):
+def masks(pts, fields=None):
+    """Wound and far-field node sets, fixed once from the first snapshot.
+
+    Wound nodes are identified by their FIELD state (depleted rho), not by
+    geometry. The geometric test is unreliable here: the puncture snap-open
+    displaces nodes by more than the 0.25 mm wound radius, so a fixed
+    geometric mask applied to deformed coordinates caught only 40 of the 101
+    nodes the driver actually seeded. Field state travels with the material.
+    """
     wound, far = [], []
+    if fields and "rho" in fields:
+        rho = fields["rho"]
+        wound = [i for i in range(len(pts)) if rho[i] < 0.5]
+    if not wound:  # fall back to geometry (e.g. a no-wound settle series)
+        for idx, (x, y, z) in enumerate(pts):
+            r2 = (y - Y_CENTER) ** 2 + (z - Z_CENTER) ** 2
+            if (X_LO - 1e-3 <= x <= X_HI) and r2 <= (R_WOUND + 1e-3) ** 2:
+                wound.append(idx)
+    wset = set(wound)
+    # Far field: well away from every wound node, measured in the deformed
+    # configuration of the first snapshot.
     for idx, (x, y, z) in enumerate(pts):
-        r2 = (y - Y_CENTER) ** 2 + (z - Z_CENTER) ** 2
-        inside = (X_LO - 1e-3 <= x <= X_HI) and r2 <= (R_WOUND + 1e-3) ** 2
-        if inside:
-            wound.append(idx)
-        elif r2 > (6.0 * R_WOUND) ** 2:
+        if idx in wset:
+            continue
+        d2 = min((y - pts[w][1]) ** 2 + (z - pts[w][2]) ** 2 for w in wound) if wound else 1e30
+        if d2 > (6.0 * R_WOUND) ** 2:
             far.append(idx)
     return wound, far
 
@@ -118,11 +136,12 @@ def main():
 
     print(f"{len(files)} snapshots, steps {files[0][0]}..{files[-1][0]}, dt={a.dt} h\n")
 
-    pts, _ = read_vtk(files[0][1])
-    wound, far = masks(pts)
+    pts, f0 = read_vtk(files[0][1])
+    wound, far = masks(pts, f0)
     # Wound nodes are identified ONCE, from the first snapshot, so the same set
     # is tracked as the tissue deforms.
-    print(f"{len(pts)} nodes: {len(wound)} in the wound, {len(far)} far field\n")
+    print(f"{len(pts)} nodes: {len(wound)} in the wound (by depleted rho), "
+          f"{len(far)} far field\n")
     if not wound:
         print("FAIL: wound region is empty - check the geometry constants")
         return 1
@@ -150,10 +169,11 @@ def main():
         # needle-track axis, in the plane normal to it. A falling value means the
         # puncture is closing.
         cur_pts, _ = read_vtk(p)
-        rr = 0.0
-        for i in wound:
-            _, yy, zz = cur_pts[i]
-            rr += (yy - Y_CENTER) ** 2 + (zz - Z_CENTER) ** 2
+        # Spread about the wound's own centroid, so the metric measures closure
+        # rather than bulk motion of the patch.
+        cy = sum(cur_pts[i][1] for i in wound) / len(wound)
+        cz = sum(cur_pts[i][2] for i in wound) / len(wound)
+        rr = sum((cur_pts[i][1] - cy) ** 2 + (cur_pts[i][2] - cz) ** 2 for i in wound)
         rms = math.sqrt(rr / len(wound)) if wound else float("nan")
         series.append((t, rw, cw, pw, aw, rf, cf, pf, af, gmin, rms))
         print(f"{t:8.1f} {rw:9.5f} {cw:9.5f} {pw:9.5f} {aw:9.5f} "
