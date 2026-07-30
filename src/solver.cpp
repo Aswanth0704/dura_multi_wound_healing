@@ -1024,7 +1024,18 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             // from rescuing a genuinely diverged step: the unconverged steps
             // that once produced concentrations of -1.66 carried increments of
             // ~124, seven orders above tol_inc.
-            if(normSOL <= myTissue.tol_inc && residuum <= 1.0e3*myTissue.tol){
+            // Gated on the iteration count so this stays an ESCAPE HATCH and
+            // does not become the primary convergence test. The residual is
+            // checked at the top of the loop and this test at the bottom, so
+            // ungated it preempts the residual: it fired on 225 of 225 steps,
+            // at iteration 2-3, accepting a median residual of 8.6e-6 against a
+            // tol of 1e-6. Only 3 of those were real limit cycles. Ordinary
+            // steps converge in 3-4 iterations, so iteration 10 is unambiguous
+            // stagnation, and a true stall escapes here instead of burning 200
+            // iterations and then being rejected.
+            const int min_iter_stagnation = 10;
+            if(iter >= min_iter_stagnation
+               && normSOL <= myTissue.tol_inc && residuum <= 1.0e3*myTissue.tol){
                 std::cout<<"\nincrement collapsed to "<<normSOL<<" (<= "
                          <<myTissue.tol_inc<<") with residual "<<residuum
                          <<" - state has stopped moving, accepting the step\n";
