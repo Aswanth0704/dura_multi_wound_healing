@@ -124,6 +124,83 @@ inside an `omp critical`, so scaling saturates (observed 350–530% of 1200%).
 
 ---
 
+## Next up — parallel assembly (the throughput bottleneck)
+
+**Measured cost:** ~2 min per global Newton step on the 2t_finer mesh (≈5k nodes,
+12 threads), at 4 Newton iterations per step. A 169 h heal at `dt = 0.2` is
+~845 steps ≈ 28 h; at `dt = 0.05` it is ~110 h. The 20t production mesh is ~4×
+larger and will be proportionally worse. Observed thread utilisation is
+350–530% of a possible 1200%.
+
+**Cause.** The element loop (`solver.cpp:394`) is `#pragma omp parallel for`, but
+it contains two `omp critical` regions that serialise most of the body:
+
+| Site | What it guards | Verdict |
+|---|---|---|
+| `solver.cpp:521` | IP store-back **and** the `node_phi`/`node_dphif*`/`node_ip_count` scatter | mostly unnecessary |
+| `solver.cpp:545` | the **entire** triplet assembly + `RR` scatter — ~100 lines, 16 tangent blocks | the real serialisation |
+
+### Step A — drop the first critical section
+Everything it writes to `myTissue.ip_*` is indexed `ei*IP_size + ipi`, which is
+**unique per element**, so threads never touch the same slot — no race exists.
+The only genuine race is the `node_*` accumulation, which is a nodal scatter over
+shared nodes. Those four vectors are the ones from known defect 5: sized
+`n_node`, then `.clear()`ed, then indexed, and only reachable through the dead
+surface-BC block. So either delete them outright or guard just those four lines
+with `#pragma omp atomic`, and remove the `critical` from the IP store-back.
+
+### Step B — per-thread triplet buffers
+Replace the single shared `KK_triplets` with one buffer per thread, merged after
+the loop; likewise a per-thread `RR` reduced at the end.
+
+```cpp
+const int nthreads = omp_get_max_threads();
+std::vector<std::vector<T>> KK_tl(nthreads);
+std::vector<VectorXd>       RR_tl(nthreads, VectorXd::Zero(n_dof));
+// reserve() per thread from an element-count estimate — the reallocation
+// storm is itself a measurable cost at ~1e6 triplets.
+#pragma omp parallel for
+for (int ei = 0; ei < n_elem; ei++) {
+    const int tid = omp_get_thread_num();
+    ... KK_tl[tid].push_back(...); RR_tl[tid](dof) += ...;   // no critical
+}
+for (int t = 0; t < nthreads; t++) {
+    KK_triplets.insert(KK_triplets.end(), KK_tl[t].begin(), KK_tl[t].end());
+    RR += RR_tl[t];
+}
+```
+
+`setFromTriplets` sums duplicates, so concatenation order does not change the
+assembled matrix. `RR` is a floating-point reduction, so the summation order
+*does* change the last bits — reduce in a fixed thread order (the loop above) to
+keep it run-to-run deterministic.
+
+*Accept:* on the 2t mesh, a settle run must be **byte-identical** to the current
+output (this is a pure refactor — treat any diff as a bug), and the wall clock
+per step should drop toward the serial-fraction limit. Then re-measure the
+`--ntasks` scaling curve and update the "keep it at ~12" advice in `CLAUDE.md`
+and `files/woundcpp3D.sub`, which only exists *because* of this bottleneck.
+
+### Step C — is assembly even the dominant cost? Measure first.
+Before doing B, put timers around the three candidates for one step: the element
+loop, `localWoundProblemExplicit` inside it, and the linear solve. The local
+solver does `time_step_ratio (25) × IP count × Newton iterations` forward-Euler
+updates per step, and the direct `SparseLU` factorisation is refactorised every
+iteration — either could dominate, in which case fixing the critical sections
+buys little. **Do C first**; it is 20 lines and decides whether B is worth it.
+
+### Multi-node is a separate, much larger job
+Steps A–B are shared-memory only: they make one node's 12–16 cores actually
+work, and cannot go past a single node. Spanning **multiple nodes** needs MPI —
+mesh partitioning (METIS), ghost-layer exchange, a distributed sparse matrix and
+a distributed solve (PETSc/Trilinos, since `SparseLU` and Eigen's `BiCGSTAB` are
+both serial-in-process). That is a rewrite of `sparseWoundSolver`, not a patch,
+and it is only worth starting if A–C leave the 20t production mesh too slow.
+Note the current `.sub` requests `--ntasks=12` on `--nodes=1` and runs pure
+OpenMP, so those "tasks" are already threads, not ranks.
+
+---
+
 ## Open items
 
 - **α retains a small (~1.7%) transient undershoot at the wound front**, while
