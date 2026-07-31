@@ -98,17 +98,29 @@ static void buildParameters(std::vector<double>& gp, std::vector<double>& lp)
 
     // NOSTRUCT freezes the structural update, so dphif/da0/dkappa/dlamdaP with
     // respect to CC all vanish and DDstruct drops out of Ke_x_x.
-    const double fz = envOn("TANGENT_NOSTRUCT") ? 0.0 : 1.0;
-    const double p_phi = fz*9.34e-4, p_phi_c = fz*1.41e-3, p_phi_theta = 4.96*p_phi;
-    const double K_phi_c = 1.08, d_phi = fz*2.02e-3, d_phi_rho_c = fz*2.87e-4;
+    // NOSTRUCT freezes the structural response so DDstruct drops out of Ke_x_x:
+    // it kills the mechano-driven collagen production (the only route by which
+    // phif depends on CC) and stretches every structural timescale to 1e6 h so
+    // a0, kappa and lamdaP cannot move within a step. p_phi itself is NOT
+    // zeroed - K_phi_rho is derived from it and would blow up, which is what
+    // made the first attempt at this probe return NaN.
+    const bool nostruct = envOn("TANGENT_NOSTRUCT");
+    // Individual freezes, to say WHICH structural variable carries the error.
+    const bool no_phi    = nostruct || envOn("TANGENT_NOPHI");
+    const bool no_a0     = nostruct || envOn("TANGENT_NOA0");
+    const bool no_kappa  = nostruct || envOn("TANGENT_NOKAPPA");
+    const bool no_lamdaP = nostruct || envOn("TANGENT_NOLAMDAP");
+    const double p_phi = 9.34e-4, p_phi_c = 1.41e-3;
+    const double p_phi_theta = no_phi ? 0.0 : 4.96*p_phi;
+    const double K_phi_c = 1.08, d_phi = 2.02e-3, d_phi_rho_c = 2.87e-4;
     const double K_phi_rho = deriveKphirho(p_phi, p_phi_c, p_phi_theta, K_phi_c,
                                            d_phi, d_phi_rho_c, c_h, rho_h, phi_h, H_h);
-    const double tau_omega = 10.0/(K_phi_rho+1.0);
-    const double tau_kappa =  1.0/(K_phi_rho+1.0);
+    const double tau_omega = no_a0    ? 1e6 : 10.0/(K_phi_rho+1.0);
+    const double tau_kappa = no_kappa  ? 1e6 :  1.0/(K_phi_rho+1.0);
     const double gamma_kappa = 5.0;
     lp = { p_phi, p_phi_c, p_phi_theta, K_phi_c, K_phi_rho, d_phi, d_phi_rho_c,
            tau_omega, tau_kappa, gamma_kappa,
-           0.05, 0.05, 0.05,           // tau_lamdaP_a/s/n
+           no_lamdaP?1e6:0.05, no_lamdaP?1e6:0.05, no_lamdaP?1e6:0.05,  // tau_lamdaP_a/s/n
            vartheta_e, gamma_theta,
            1e-8, substeps(), 100.0,    // tol_local, time_step_ratio, max_iter
            0.85, 1.15,                 // lamdaE_lo, lamdaE_hi
@@ -202,8 +214,196 @@ static VectorXd residual(const State& S0, const State& S,
     return R;
 }
 
+
+// ---------------------------------------------------------------------------
+// PROBE: SSe_pas vs CCe, one level below the element tangent.
+//
+// The element test says Ke_x_x is 5.5e-4 wrong and every sweep says the error
+// is purely analytic. Ke_x_x contains the passive fiber tangent DDe pulled back
+// through Fg, so this checks DDe on its own, BEFORE the pull-back - if DDe is
+// right here, the error is in the pull-back or elsewhere; if it is wrong here,
+// the algebra is wrong and the pull-back is innocent.
+//
+// Uses DIRECTIONAL derivatives along a symmetric direction M rather than
+// perturbing individual components. Perturbing CCe(c,d) alone breaks the
+// symmetry of CCe, and symmetrising the perturbation reintroduces the
+// factor-of-2 convention trap that already bit the mechanosensing test in this
+// project. A directional derivative has no convention to get wrong:
+//     d/dh SSe(CCe + h M) |_0   ==   DDe : M
+// ---------------------------------------------------------------------------
+static void SSe_pas_of(const Matrix3d& CCe, const Vector3d& a0,
+                       double kappa, double phif, double k0, double kf, double k2,
+                       Matrix3d& SSe)
+{
+    const Matrix3d a0a0 = a0*a0.transpose();
+    const double I1e = CCe.trace();
+    const double I4e = a0.dot(CCe*a0);
+    const double E   = kappa*I1e + (1-3*kappa)*I4e - 1.0;
+    const double Psif  = (kf/(2.*k2))*std::exp(k2*E*E);
+    const double Psif1 = 2*k2*kappa*E*Psif;
+    const double Psif4 = 2*k2*(1-3*kappa)*E*Psif;
+    SSe = phif*(k0*Matrix3d::Identity() + Psif1*Matrix3d::Identity() + Psif4*a0a0);
+}
+
+static int probeDDe()
+{
+    // Wound-state values, matching the element test.
+    const double kappa = 0.11, phif = 0.47;
+    const double k0 = 0.02, kf = 40.0, k2 = 0.048;
+    const Vector3d a0(0,0,1);
+    const Matrix3d a0a0 = a0*a0.transpose();
+
+    // A representative elastic right Cauchy-Green tensor: prestretched, sheared.
+    Matrix3d CCe;
+    CCe << 1.0298, 0.0121, 0.0043,
+           0.0121, 0.8771, 0.0072,
+           0.0043, 0.0072, 1.1153;
+
+    const double I1e = CCe.trace();
+    const double I4e = a0.dot(CCe*a0);
+    const double E   = kappa*I1e + (1-3*kappa)*I4e - 1.0;
+    const double Psif  = (kf/(2.*k2))*std::exp(k2*E*E);
+    const double Psif1 = 2*k2*kappa*E*Psif;
+    const double Psif4 = 2*k2*(1-3*kappa)*E*Psif;
+
+    // The four coefficients exactly as src/wound.cpp writes them.
+    const double Psif11 = 2*k2*kappa*kappa*Psif + 2*k2*kappa*E*Psif1;
+    const double Psif14 = 2*k2*kappa*(1-3*kappa)*Psif + 2*k2*kappa*E*Psif4;
+    const double Psif41 = 2*k2*(1-3*kappa)*kappa*Psif + 2*k2*(1-3*kappa)*E*Psif1;
+    const double Psif44 = 2*k2*(1-3*kappa)*(1-3*kappa)*Psif + 2*k2*(1-3*kappa)*E*Psif4;
+
+    std::printf("\n[probe] passive fiber tangent DDe, before the Fg pull-back\n");
+    std::printf("  I1e=%.5f I4e=%.5f E=%.5f\n", I1e, I4e, E);
+    std::printf("  Psif14=%.6e  Psif41=%.6e   (must be equal)  rel diff %.2e\n",
+                Psif14, Psif41, std::fabs(Psif14-Psif41)/std::fabs(Psif41));
+
+    // Three independent symmetric directions, including a pure shear.
+    Matrix3d dirs[3];
+    dirs[0] = Matrix3d::Identity();
+    dirs[1] = a0a0;
+    dirs[2] << 0, 1, 0,
+               1, 0, 0,
+               0, 0, 0;
+
+    int bad = 0;
+    for(int d=0; d<3; d++){
+        const Matrix3d& M = dirs[d];
+        // analytic: DDe : M
+        const double trM   = M.trace();
+        const double a0Ma0 = a0.dot(M*a0);
+        Matrix3d ana = phif*( (Psif11*trM + Psif14*a0Ma0)*Matrix3d::Identity()
+                            + (Psif41*trM + Psif44*a0Ma0)*a0a0 );
+        // numerical: central difference of SSe_pas along M
+        const double h = 1e-6;
+        Matrix3d Sp, Sm;
+        SSe_pas_of(CCe + h*M, a0, kappa, phif, k0, kf, k2, Sp);
+        SSe_pas_of(CCe - h*M, a0, kappa, phif, k0, kf, k2, Sm);
+        Matrix3d num = (Sp - Sm)/(2.0*h);
+
+        const double err = (ana-num).cwiseAbs().maxCoeff();
+        const double rel = err/std::max(1e-30, ana.cwiseAbs().maxCoeff());
+        const bool ok = rel < 1e-6;
+        if(!ok) ++bad;
+        std::printf("  direction %d: max|ana| %.4e  max|err| %.4e  rel %.2e  %s\n",
+                    d, ana.cwiseAbs().maxCoeff(), err, rel, ok ? "ok" : "MISMATCH");
+    }
+    std::printf("  -> DDe itself is %s\n\n", bad ? "WRONG" : "correct");
+    return bad;
+}
+
+
+// ---------------------------------------------------------------------------
+// PROBE 2: the Fg pull-back, dSS_pas/dCC.
+//
+// DDe (probe 1) is correct, so if the element-level Ke_x_x error is in the
+// passive path it must live in the pull-back
+//     SS_pas = Jp * Fginv * SSe_pas * Fginv,     CCe = Fginv * CC * Fginv
+// This replicates src/wound.cpp's dSSpasdCC_explicit expression EXACTLY and
+// finite-differences SS_pas along symmetric directions in CC, holding the
+// structure (phif, a0, kappa, lamdaP) fixed - which is what "explicit" means
+// there.
+// ---------------------------------------------------------------------------
+static int probePullback()
+{
+    const double kappa = 0.11, phif = 0.47;
+    const double k0 = 0.02, kf = 40.0, k2 = 0.048;
+    const Vector3d a0(0,0,1), s0(1,0,0), n0(0,1,0);
+    const Vector3d lamdaP(1.04, 1.02, 0.94);   // along (a0, s0, n0)
+
+    Matrix3d Fg = lamdaP(0)*a0*a0.transpose()
+                + lamdaP(1)*s0*s0.transpose()
+                + lamdaP(2)*n0*n0.transpose();
+    const Matrix3d FFginv = Fg.inverse();
+    const double Jp = Fg.determinant();
+
+    Matrix3d CC;
+    CC << 1.0714, 0.0128, 0.0047,
+          0.0128, 0.9126, 0.0079,
+          0.0047, 0.0079, 1.2062;
+
+    auto SS_pas_of = [&](const Matrix3d& CCin){
+        Matrix3d CCe = FFginv*CCin*FFginv;
+        Matrix3d SSe; SSe_pas_of(CCe, a0, kappa, phif, k0, kf, k2, SSe);
+        return Matrix3d(Jp*FFginv*SSe*FFginv);
+    };
+
+    // Rebuild the coefficients at the base point, as wound.cpp does.
+    Matrix3d CCe0 = FFginv*CC*FFginv;
+    const Matrix3d a0a0 = a0*a0.transpose();
+    const double I1e = CCe0.trace(), I4e = a0.dot(CCe0*a0);
+    const double E = kappa*I1e + (1-3*kappa)*I4e - 1.0;
+    const double Psif  = (kf/(2.*k2))*std::exp(k2*E*E);
+    const double Psif1 = 2*k2*kappa*E*Psif;
+    const double Psif4 = 2*k2*(1-3*kappa)*E*Psif;
+    const double Psif11 = 2*k2*kappa*kappa*Psif + 2*k2*kappa*E*Psif1;
+    const double Psif14 = 2*k2*kappa*(1-3*kappa)*Psif + 2*k2*kappa*E*Psif4;
+    const double Psif41 = 2*k2*(1-3*kappa)*kappa*Psif + 2*k2*(1-3*kappa)*E*Psif1;
+    const double Psif44 = 2*k2*(1-3*kappa)*(1-3*kappa)*Psif + 2*k2*(1-3*kappa)*E*Psif4;
+
+    // dSSpasdCC exactly as coded in src/wound.cpp.
+    std::vector<double> dSS(81, 0.0);
+    const Matrix3d Id = Matrix3d::Identity();
+    for(int ii=0;ii<3;ii++)for(int jj=0;jj<3;jj++)for(int kk=0;kk<3;kk++)for(int ll=0;ll<3;ll++)
+      for(int pp=0;pp<3;pp++)for(int rr=0;rr<3;rr++)for(int ss=0;ss<3;ss++)for(int tt=0;tt<3;tt++)
+        dSS[ii*27+jj*9+kk*3+ll] += Jp*(phif*(Psif11*Id(pp,rr)*Id(ss,tt)
+                                   + Psif14*Id(pp,rr)*a0a0(ss,tt)
+                                   + Psif41*a0a0(pp,rr)*Id(ss,tt)
+                                   + Psif44*a0a0(pp,rr)*a0a0(ss,tt)))
+                                   *FFginv(ii,pp)*FFginv(jj,rr)*FFginv(kk,ss)*FFginv(ll,tt);
+
+    std::printf("[probe] Fg pull-back, dSS_pas/dCC\n");
+    Matrix3d dirs[4];
+    dirs[0] = Id;
+    dirs[1] = a0*a0.transpose();
+    dirs[2] << 0,0,1, 0,0,0, 1,0,0;      // shear in the a0-s0 plane
+    dirs[3] << 0,0,0, 0,0,1, 0,1,0;      // shear in the a0-n0 plane
+
+    int bad = 0;
+    for(int d=0; d<4; d++){
+        const Matrix3d& M = dirs[d];
+        Matrix3d ana = Matrix3d::Zero();
+        for(int ii=0;ii<3;ii++)for(int jj=0;jj<3;jj++)for(int kk=0;kk<3;kk++)for(int ll=0;ll<3;ll++)
+            ana(ii,jj) += dSS[ii*27+jj*9+kk*3+ll]*M(kk,ll);
+        const double h = 1e-6;
+        Matrix3d num = (SS_pas_of(CC + h*M) - SS_pas_of(CC - h*M))/(2.0*h);
+        const double err = (ana-num).cwiseAbs().maxCoeff();
+        const double scl = std::max(ana.cwiseAbs().maxCoeff(), num.cwiseAbs().maxCoeff());
+        const double rel = (scl>0) ? err/scl : err;
+        const bool ok = rel < 1e-6;
+        if(!ok) ++bad;
+        std::printf("  direction %d: max|ana| %.4e  max|num| %.4e  rel %.2e  %s\n",
+                    d, ana.cwiseAbs().maxCoeff(), num.cwiseAbs().maxCoeff(), rel,
+                    ok ? "ok" : "MISMATCH");
+    }
+    std::printf("  -> the pull-back expression is %s\n\n", bad ? "WRONG" : "correct");
+    return bad;
+}
+
 int main()
 {
+    probeDDe();
+    probePullback();
+
     std::vector<Vector4d> IP = LineQuadriIPTet();
     const int nip = (int)IP.size();
     const double dt = 0.2;
