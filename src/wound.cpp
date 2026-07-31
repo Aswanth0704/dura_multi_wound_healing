@@ -809,7 +809,16 @@ void evalWound(
         // MECHANICS TANGENT
         //
         double Psif11 = 2*k2*kappa*kappa*Psif+2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif1 ;
-        double Psif14 = 2*k2*kappa*(1-3*kappa)*I4e*Psif + 2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif4;
+        // NOTE: no I4e factor here. Psif14 and Psif41 are both d2Psi/dI1e dI4e
+        // and must be equal by symmetry of second derivatives; writing E for
+        // (kappa*I1e + (1-3kappa)*I4e - 1), both evaluate to
+        //     2*k2*kappa*(1-3kappa)*Psif*(1 + 2*k2*E*E).
+        // Psif14 carried a spurious I4e on its first term (about 1.2 in the
+        // healthy state), breaking that symmetry and leaving Ke_x_x
+        // inconsistent with the residual. Caught by tests/test_tangent: the
+        // Ke_x_x error sat flat at 1.3e-2 across an 80-fold sweep of the inner
+        // substep size, so it could not be a discretisation artifact.
+        double Psif14 = 2*k2*kappa*(1-3*kappa)*Psif + 2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif4;
         double Psif41 = 2*k2*(1-3*kappa)*kappa*Psif + 2*k2*(1-3*kappa)*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif1;
         double Psif44 = 2*k2*(1-3*kappa)*(1-3*kappa)*Psif + 2*k2*(1-3*kappa)*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif4;
         std::vector<double> dSSpasdCC_explicit(81,0.);

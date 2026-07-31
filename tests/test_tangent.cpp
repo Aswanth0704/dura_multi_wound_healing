@@ -48,6 +48,17 @@ static const int NDIM  = 3;
 // ---------------------------------------------------------------------------
 // Parameter block, mirroring the driver so the test exercises the real regime.
 // ---------------------------------------------------------------------------
+// Substep count of the explicit inner structural solver, overridable so the
+// tangent error can be tested for discretisation dependence: the analytic
+// tangent describes the CONTINUOUS remodelling law while the residual evaluates
+// the DISCRETISED one, so if that gap is the cause the error should shrink as
+// the substeps are refined, and sit still if a term is genuinely missing.
+static double substeps()
+{
+    const char* e = std::getenv("TANGENT_SUBSTEPS");
+    return e ? std::atof(e) : 25.0;
+}
+
 static void buildParameters(std::vector<double>& gp, std::vector<double>& lp)
 {
     // Values copied EXACTLY from the driver. An earlier version of this test
@@ -89,7 +100,7 @@ static void buildParameters(std::vector<double>& gp, std::vector<double>& lp)
            tau_omega, tau_kappa, gamma_kappa,
            0.05, 0.05, 0.05,           // tau_lamdaP_a/s/n
            vartheta_e, gamma_theta,
-           1e-8, 25.0, 100.0,          // tol_local, time_step_ratio, max_iter
+           1e-8, substeps(), 100.0,    // tol_local, time_step_ratio, max_iter
            0.85, 1.15,                 // lamdaE_lo, lamdaE_hi
            0.002 };                    // lamdaE_bandw
 }
