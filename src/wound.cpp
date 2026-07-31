@@ -1057,7 +1057,18 @@ void evalWound(
                         //dQ_rhodCC_explicit[ii*9+kk*3+ll] += -1.0*(-3*(D_rhorho-phif*(D_rhorho-D_rhorho/10))*A0(ii,jj)*Grad_rho(jj)
                         //        - 3*(D_rhoc-phif*(D_rhoc-D_rhoc/10))*rho*A0(ii,jj)*Grad_c(jj))*dtrAdCC(kk,ll) / (trA*trA);
 
-                        dQ_cdCC_explicit[ii*9+kk*3+ll] += -0.5*(-1.0*(D_cc-phif*(D_cc-D_cc/10)))*(CCinv(ii,kk)*CCinv(jj,ll)+CCinv(jj,kk)*CCinv(ii,ll))*Grad_c(jj);
+                        // D_cc, NOT the collagen-dependent (D_cc - phif*(D_cc - D_cc/10)).
+                        // The residual uses a constant cytokine diffusivity -
+                        //     Q_c = -D_cc*CCinv*Grad_c
+                        // - and the collagen-dependent form sits commented out
+                        // directly beneath it. The tangent was never updated to
+                        // match, so at healthy collagen (phif = 1) it used
+                        // D_cc/10: ten times too small. Measured by
+                        // tests/test_tangent as Ke_c_x carrying an error an
+                        // order of magnitude LARGER than the block itself,
+                        // because the flux contribution was almost entirely
+                        // absent while the source contribution was correct.
+                        dQ_cdCC_explicit[ii*9+kk*3+ll] += -0.5*(-1.0*D_cc)*(CCinv(ii,kk)*CCinv(jj,ll)+CCinv(jj,kk)*CCinv(ii,ll))*Grad_c(jj);
 
                         // alpha: Q_alpha = -D_alpha CCinv Grad_alpha, same form
                         dQ_alphadCC_explicit[ii*9+kk*3+ll] += -0.5*(-1.0*D_alpha)*(CCinv(ii,kk)*CCinv(jj,ll)+CCinv(jj,kk)*CCinv(ii,ll))*Grad_alpha(jj);
