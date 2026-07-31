@@ -342,6 +342,32 @@ int main()
                     B.name, scale, err, rel, ok ? "ok" : "MISMATCH");
     }
 
+    // Where in Ke_x_x does the error live, and is it symmetric? Ke_x_x is not
+    // required to be symmetric overall (the active traction is not
+    // hyperelastic), but the passive part comes from a stored energy, so a
+    // clearly ANTI-symmetric error pattern points at a transposed index pair.
+    {
+        MatrixXd E = K.block(0,0,12,12) - Kfd.block(0,0,12,12);
+        const double sym  = 0.5*(E + E.transpose()).cwiseAbs().maxCoeff();
+        const double anti = 0.5*(E - E.transpose()).cwiseAbs().maxCoeff();
+        std::printf("\n  Ke_x_x error: symmetric part %.3e, antisymmetric part %.3e\n",
+                    sym, anti);
+        // top offenders
+        for(int rank=0; rank<4; rank++){
+            int br=-1, bc=-1; double best=-1;
+            for(int r=0;r<12;r++) for(int c=0;c<12;c++){
+                double v = std::fabs(E(r,c));
+                bool taken=false;
+                for(int q=0;q<rank;q++) ; // simple: just report the top few by scan
+                if(v>best){ best=v; br=r; bc=c; }
+            }
+            if(br<0) break;
+            std::printf("    largest |err| %.3e at (node %d dir %d, node %d dir %d)  K=%.4e  Kfd=%.4e\n",
+                        best, br/3, br%3, bc/3, bc%3, K(br,bc), Kfd(br,bc));
+            E(br,bc) = 0.0;
+        }
+    }
+
     std::printf("\n  %d of 16 blocks disagree with the numerical derivative\n", bad);
     if(bad){
         std::printf("  -> Newton cannot converge quadratically with these; the\n"
