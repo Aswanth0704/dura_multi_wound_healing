@@ -486,8 +486,28 @@ void localWoundProblemExplicit(
             dThetadCC(12+II) += local_dt*da0dCC[1](ii,jj);
             dThetadCC(18+II) += local_dt*da0dCC[2](ii,jj);
             // kappa
-            dThetadCC(24+II) += (local_dt/(tau_kappa))*((dphifdotplusdCC(ii,jj)*(pow(lamdamed/lamdamax,gamma_kappa)/3. - kappa))
-                                                        + ((phif_dot_plus/3.)*(pow(dlamdameddCC(ii,jj)/lamdamax,gamma_kappa) - pow(lamdamed*dlamdamaxdCC(ii,jj)/(lamdamax*lamdamax),gamma_kappa))));
+            // kappa evolves toward (lamdamed/lamdamax)^gamma_kappa / 3, so the
+            // CC-derivative of that target is
+            //     gamma*(r)^(gamma-1) * dr/dCC,     r = lamdamed/lamdamax
+            //     dr/dCC = dlamdamed/dCC / lamdamax
+            //              - lamdamed * dlamdamax/dCC / lamdamax^2
+            // The exponent becomes a MULTIPLYING factor; it does not apply to
+            // the derivative. This used to read
+            //     pow(dlamdameddCC/lamdamax, gamma) - pow(lamdamed*dlamdamaxdCC/lamdamax^2, gamma)
+            // i.e. it raised the derivative itself to the fifth power
+            // (gamma_kappa = 5) and differenced the two pieces before applying
+            // the chain rule rather than after. Caught by tests/test_tangent:
+            // freezing the structural response made Ke_x_x exact, and within
+            // that the error tracked the fiber dispersion.
+            {
+                const double r      = lamdamed/lamdamax;
+                const double drdCC  = dlamdameddCC(ii,jj)/lamdamax
+                                    - lamdamed*dlamdamaxdCC(ii,jj)/(lamdamax*lamdamax);
+                const double dtarget = gamma_kappa*std::pow(r, gamma_kappa-1.0)*drdCC;
+                dThetadCC(24+II) += (local_dt/(tau_kappa))*(
+                                      (dphifdotplusdCC(ii,jj)*(std::pow(r,gamma_kappa)/3. - kappa))
+                                    + ((phif_dot_plus/3.)*dtarget));
+            }
 //            // No threshold
 //            // lamdaPa, lamdaPs, lamdaPn
 //            dThetadCC(30+II) += (local_dt/tau_lamdaP_a)*((dphifdotplusdCC(ii,jj)*(lamdaE_a-1)) + (phif_dot_plus*(dlamdaE_a_dCC(ii,jj))));

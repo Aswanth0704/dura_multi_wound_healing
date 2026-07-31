@@ -399,10 +399,109 @@ static int probePullback()
     return bad;
 }
 
+
+// ---------------------------------------------------------------------------
+// PROBE 3: the eigenvector derivative in local_solver.cpp.
+//
+// Freezing the structural response makes Ke_x_x exact, and within that the
+// error tracks the fiber DIRECTION and DISPERSION - both of which are driven by
+// the principal eigenpair of CCe. local_solver.cpp gets dv/dCCe from a bordered
+// linear system
+//     [ CCe - lamda I   -v ] [ dv     ]   [ -(dCCe) v ]
+//     [ v^T              0 ] [ dlamda ] = [     0     ]
+// solved once per elementary perturbation E_ij. This checks that against a
+// finite difference of the actual eigen-decomposition.
+//
+// Eigenvector SIGN is the trap here: SelfAdjointEigenSolver picks a sign
+// arbitrarily and it can flip between the + and - evaluations, which would show
+// up as a huge spurious error. Both perturbed eigenvectors are therefore
+// re-signed to agree with the base one before differencing.
+// ---------------------------------------------------------------------------
+static void topEigen(const Matrix3d& A, const Vector3d& ref, double& lam, Vector3d& v)
+{
+    SelfAdjointEigenSolver<Matrix3d> es; es.compute(A);
+    lam = es.eigenvalues()(2);
+    v   = es.eigenvectors().col(2);
+    if(ref.dot(v) < 0) v = -v;      // fix the arbitrary sign against a reference
+}
+
+static int probeEigenDeriv()
+{
+    Matrix3d CCe;
+    CCe << 1.0298, 0.0121, 0.0043,
+           0.0121, 0.8771, 0.0072,
+           0.0043, 0.0072, 1.1153;
+
+    SelfAdjointEigenSolver<Matrix3d> es; es.compute(CCe);
+    const Vector3d lam3 = es.eigenvalues();
+    Vector3d v = es.eigenvectors().col(2);
+    const Vector3d a0(0,0,1);
+    if(a0.dot(v) < 0) v = -v;
+    const double lamdamax = lam3(2);
+
+    std::printf("[probe] eigenvector derivative (bordered system)\n");
+    std::printf("  eigenvalues %.6f %.6f %.6f   gaps %.4e %.4e\n",
+                lam3(0), lam3(1), lam3(2), lam3(2)-lam3(1), lam3(1)-lam3(0));
+
+    // Replicate the bordered solve exactly as local_solver.cpp does it.
+    Matrix4d LHS; Vector4d RHS, SOL;
+    LHS << CCe(0,0)-lamdamax, CCe(0,1), CCe(0,2), -v(0),
+           CCe(1,0), CCe(1,1)-lamdamax, CCe(1,2), -v(1),
+           CCe(2,0), CCe(2,1), CCe(2,2)-lamdamax, -v(2),
+           v(0), v(1), v(2), 0;
+    std::vector<Matrix3d> dvdCCe(3, Matrix3d::Zero());
+    Matrix3d dlamdCCe = Matrix3d::Zero();
+    for(int ii=0;ii<3;ii++) for(int jj=0;jj<3;jj++){
+        RHS.setZero(); RHS(ii) = -v(jj);
+        SOL = LHS.lu().solve(RHS);
+        dvdCCe[0](ii,jj) = SOL(0);
+        dvdCCe[1](ii,jj) = SOL(1);
+        dvdCCe[2](ii,jj) = SOL(2);
+        dlamdCCe(ii,jj)  = SOL(3);
+    }
+
+    // Symmetric probe directions.
+    Matrix3d dirs[4];
+    dirs[0] = Matrix3d::Identity();
+    dirs[1] << 1,0,0, 0,0,0, 0,0,0;
+    dirs[2] << 0,1,0, 1,0,0, 0,0,0;      // pure shear
+    dirs[3] << 0,0,0, 0,0,1, 0,1,0;      // pure shear
+
+    int bad = 0;
+    for(int d=0; d<4; d++){
+        const Matrix3d& M = dirs[d];
+        // analytic, contracted over ALL nine components as the caller does
+        Vector3d ana = Vector3d::Zero();
+        double anaLam = 0.0;
+        for(int ii=0;ii<3;ii++) for(int jj=0;jj<3;jj++){
+            for(int m=0;m<3;m++) ana(m) += dvdCCe[m](ii,jj)*M(ii,jj);
+            anaLam += dlamdCCe(ii,jj)*M(ii,jj);
+        }
+        const double h = 1e-6;
+        double lp, lm; Vector3d vp, vm;
+        topEigen(CCe + h*M, v, lp, vp);
+        topEigen(CCe - h*M, v, lm, vm);
+        const Vector3d num = (vp - vm)/(2.0*h);
+        const double numLam = (lp - lm)/(2.0*h);
+
+        const double errV = (ana-num).cwiseAbs().maxCoeff();
+        const double sclV = std::max(ana.cwiseAbs().maxCoeff(), num.cwiseAbs().maxCoeff());
+        const double relV = (sclV>1e-12) ? errV/sclV : errV;
+        const double relL = std::fabs(anaLam-numLam)/std::max(1e-12, std::fabs(numLam));
+        const bool ok = (relV < 1e-5) && (relL < 1e-5);
+        if(!ok) ++bad;
+        std::printf("  dir %d: dv rel %.2e (|ana| %.3e |num| %.3e)   dlamda rel %.2e  %s\n",
+                    d, relV, ana.norm(), num.norm(), relL, ok ? "ok" : "MISMATCH");
+    }
+    std::printf("  -> the eigen-derivative is %s\n\n", bad ? "WRONG" : "correct");
+    return bad;
+}
+
 int main()
 {
     probeDDe();
     probePullback();
+    probeEigenDeriv();
 
     std::vector<Vector4d> IP = LineQuadriIPTet();
     const int nip = (int)IP.size();
