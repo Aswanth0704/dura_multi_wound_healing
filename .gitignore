@@ -14,6 +14,7 @@
 !/scripts/
 !/meshing/
 !/tests/
+!/docs/
 
 # Junk that can appear inside the admitted directories
 __pycache__/
