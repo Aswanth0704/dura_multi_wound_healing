@@ -37,6 +37,7 @@
     WOUND_TOL       Newton tolerance on the relative residual
     WOUND_TOL_INC   Newton tolerance on the increment norm (limit-cycle escape)
     WOUND_TRHO      active traction t_rho [MPa]; t_rho_c follows at 3.28571x
+    WOUND_BANDW     smoothing width of the plastic-growth deadband edges
 */
 
 #include <omp.h>
@@ -416,6 +417,28 @@ int main(int argc, char *argv[])
     // slowly relaxed its own prestretch.
     double lamdaE_lo = 0.85;
     double lamdaE_hi = 1.15;
+    // Width of the SMOOTH transition at each edge of that band. The band used to
+    // be a hard if/else, which left lamdaP_dot continuous but its slope
+    // discontinuous - a C0-but-not-C1 residual. That produced Newton limit
+    // cycles AND broke the ILU preconditioner, so BiCGSTAB returned garbage.
+    //
+    // The width is bounded ABOVE by homeostasis, not by taste. A softplus edge
+    // leaks a little growth into the band interior, and the healthy
+    // through-thickness stretch lamdaE_n = 0.880 sits only 0.030 above
+    // lamdaE_lo = 0.85 - the tightest approach of the three (axial has 0.052,
+    // circumferential 0.115). The leak at that point is w*log1p(exp(-0.030/w)):
+    //
+    //     w = 0.010  ->  -4.9e-04   would remodel healthy tissue continuously,
+    //                               which is exactly the bug the widened
+    //                               deadband was introduced to fix
+    //     w = 0.005  ->  -1.2e-05
+    //     w = 0.002  ->  -6.1e-10   negligible
+    //
+    // so 0.002 it is: 15x narrower than the closest approach, yet still ~200
+    // Newton increments wide (those run ~1e-5 in lamdaE near convergence), so
+    // the transition reads as perfectly smooth to the solver. Set 0 to recover
+    // the original hard threshold exactly.
+    double lamdaE_bandw = env_dbl("WOUND_BANDW", 0.002);
     {
         const double lam_r_h = 1.0/(1.098*1.035);
         if(lamdaE_lo > lam_r_h || lamdaE_hi < 1.098)
@@ -426,7 +449,7 @@ int main(int argc, char *argv[])
     std::vector<double> local_parameters = {p_phi,p_phi_c,p_phi_theta,K_phi_c,
         K_phi_rho,d_phi,d_phi_rho_c,tau_omega,tau_kappa,gamma_kappa,
         tau_lamdaP_a,tau_lamdaP_s,tau_lamdaP_n,vartheta_e,gamma_theta,
-        tol_local,time_step_ratio,max_iter,lamdaE_lo,lamdaE_hi};
+        tol_local,time_step_ratio,max_iter,lamdaE_lo,lamdaE_hi,lamdaE_bandw};
 
     //---------------------------------//
     // Echo the parameter set and check the fixed point numerically.
@@ -443,7 +466,7 @@ int main(int argc, char *argv[])
     const char* lnames[] = {"p_phi","p_phi_c","p_phi_theta","K_phi_c","K_phi_rho*",
         "d_phi","d_phi_rho_c","tau_omega*","tau_kappa*","gamma_kappa",
         "tau_lamdaP_a","tau_lamdaP_s","tau_lamdaP_n","vartheta_e","gamma_theta",
-        "tol_local","time_step_ratio","max_iter","lamdaE_lo","lamdaE_hi"};
+        "tol_local","time_step_ratio","max_iter","lamdaE_lo","lamdaE_hi","lamdaE_bandw"};
     for(size_t i=0;i<local_parameters.size();i++)
         std::cout<<"  local ["<<std::setw(2)<<i<<"] "<<std::setw(18)<<lnames[i]
                  <<" = "<<local_parameters[i]<<"\n";

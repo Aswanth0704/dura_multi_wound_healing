@@ -30,6 +30,43 @@ This code is the implementation of the DaLaWoHe
 
 using namespace Eigen;
 
+//========================================================//
+// SMOOTH DEADBAND
+//========================================================//
+// Soft-threshold used for the plastic-growth deadband:
+//
+//     band(x) = softplus(x - hi, w) - softplus(lo - x, w)
+//
+// which is 0 well inside [lo, hi], (x - lo) well below it and (x - hi) well
+// above it - the same shape as the hard if/else it replaces - but with a
+// CONTINUOUS derivative everywhere. w sets the transition width; w -> 0
+// recovers the original piecewise-linear threshold exactly.
+//
+// softplus is evaluated in the overflow-safe form
+//     sp(x) = max(x,0) + log1p(exp(-|x|/w))*w
+// because exp(x/w) with w = 0.01 overflows for x beyond ~7.
+static inline double softplus_w(double x, double w)
+{
+    const double ax = std::fabs(x);
+    return (x > 0.0 ? x : 0.0) + w*std::log1p(std::exp(-ax/w));
+}
+// d/dx softplus_w = logistic(x/w), written so neither branch overflows.
+static inline double dsoftplus_w(double x, double w)
+{
+    const double z = x/w;
+    return (z >= 0.0) ? 1.0/(1.0 + std::exp(-z))
+                      : std::exp(z)/(1.0 + std::exp(z));
+}
+// The deadband map and its derivative.
+static inline double bandVal(double x, double lo, double hi, double w)
+{
+    return softplus_w(x - hi, w) - softplus_w(lo - x, w);
+}
+static inline double bandDer(double x, double lo, double hi, double w)
+{
+    return dsoftplus_w(x - hi, w) + dsoftplus_w(lo - x, w);
+}
+
 
 //========================================================//
 // EXPLICIT LOCAL PROBLEM: structural update
@@ -153,6 +190,31 @@ void localWoundProblemExplicit(
     double lowlim = (local_parameters.size() > 18) ? local_parameters[18] : 0.85;
     double uplim  = (local_parameters.size() > 19) ? local_parameters[19] : 1.15;
 
+    // Width of the SMOOTH transition at each band edge.
+    //
+    // The band used to be applied as a hard if/else. That makes lamdaP_dot
+    // continuous - it is zero at the edge - but its slope jumps from 0 inside to
+    // 1 outside, so the residual is C0 and not C1 and the tangent has a genuine
+    // discontinuity in lamdaE. Two symptoms traced back to it:
+    //
+    //   * Newton limit cycles. An integration point sitting on the kink makes
+    //     the iterates alternate between two states, repeating the same residual
+    //     and increment bit-for-bit for hundreds of iterations. Halving dt does
+    //     not help, since the cycle belongs to the state and not the step size.
+    //   * ILU breakdown. A discontinuous Jacobian entry is exactly what makes an
+    //     incomplete factorization useless, and BiCGSTAB then returns garbage -
+    //     sometimes reporting success while doing so.
+    //
+    // Replacing the hard threshold with a softplus blend keeps the same shape
+    // (zero inside, unit slope far outside) but makes the derivative continuous.
+    // The default 0.002 is set by homeostasis, not by taste: the healthy
+    // through-thickness stretch lamdaE_n = 0.880 sits only 0.030 above
+    // lowlim = 0.85, and a softplus edge leaks w*log1p(exp(-0.030/w)) of growth
+    // into the band interior there. w = 0.01 leaks -4.9e-4 and would remodel
+    // healthy tissue continuously; w = 0.002 leaks -6.1e-10. It is still ~200
+    // Newton increments wide, so the solver sees a smooth function.
+    const double band_w = (local_parameters.size() > 20) ? local_parameters[20] : 0.002;
+
     //std::ofstream myfile;
     //myfile.open("FE_results.csv");
 
@@ -271,32 +333,20 @@ void localWoundProblemExplicit(
 //            lamdaP_dot(2) = 0;
 //        }
 
-        // Threshold
-        // lamdaP_a
-        if(lamdaE_a < lowlim){
-            lamdaP_dot(0) = phif_dot_plus*(lamdaE_a-lowlim)/tau_lamdaP_a;
-        } else if(lamdaE_a > uplim){
-            lamdaP_dot(0) = phif_dot_plus*(lamdaE_a-uplim)/tau_lamdaP_a;
-        }
-        else{
-            lamdaP_dot(0) = 0;
-        }
-        // lamdaP_s
-        if(lamdaE_s < lowlim){
-            lamdaP_dot(1) = phif_dot_plus*(lamdaE_s-lowlim)/tau_lamdaP_s;
-        } else if(lamdaE_s > uplim){
-            lamdaP_dot(1) = phif_dot_plus*(lamdaE_s-uplim)/tau_lamdaP_s;
-        }else{
-            lamdaP_dot(1) = 0;
-        }
-        // lamdaP_n
-        if(lamdaE_n < lowlim){
-            lamdaP_dot(2) = phif_dot_plus*(lamdaE_n-lowlim)/tau_lamdaP_n;
-        } else if(lamdaE_n > uplim){
-            lamdaP_dot(2) = phif_dot_plus*(lamdaE_n-uplim)/tau_lamdaP_n;
-        }else{
-            lamdaP_dot(2) = 0;
-        }
+        // Smooth deadband (see band_w above). band_a/s/n are the soft-threshold
+        // values that replace the old (lamdaE - lim) branches; band_*_der are
+        // their derivatives, needed by the tangent below. Computed once here so
+        // the residual and every chain-rule site use the same numbers.
+        const double band_a = bandVal(lamdaE_a, lowlim, uplim, band_w);
+        const double band_s = bandVal(lamdaE_s, lowlim, uplim, band_w);
+        const double band_n = bandVal(lamdaE_n, lowlim, uplim, band_w);
+        const double band_a_der = bandDer(lamdaE_a, lowlim, uplim, band_w);
+        const double band_s_der = bandDer(lamdaE_s, lowlim, uplim, band_w);
+        const double band_n_der = bandDer(lamdaE_n, lowlim, uplim, band_w);
+
+        lamdaP_dot(0) = phif_dot_plus*band_a/tau_lamdaP_a;
+        lamdaP_dot(1) = phif_dot_plus*band_s/tau_lamdaP_s;
+        lamdaP_dot(2) = phif_dot_plus*band_n/tau_lamdaP_n;
             
 
         //----------------------------------------//
@@ -466,41 +516,23 @@ void localWoundProblemExplicit(
 
             // Threshold
             // lamdaP_a
-            if(lamdaE_a < lowlim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-                dThetadCC(30+II) += (local_dt/tau_lamdaP_a)*((dphifdotplusdCC(ii,jj)*(lamdaE_a-lowlim)) + (phif_dot_plus*(dlamdaE_a_dCC(ii,jj))));
-            } else if(lamdaE_a > uplim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-                dThetadCC(30+II) += (local_dt/tau_lamdaP_a)*((dphifdotplusdCC(ii,jj)*(lamdaE_a-uplim)) + (phif_dot_plus*(dlamdaE_a_dCC(ii,jj))));
-            } else{
-            // Inside the deadband this subcycle contributes nothing to the
-            // derivative. It must NOT be zeroed: dTheta* is accumulated with
-            // += across all time_step_ratio subcycles, so assigning 0 here
-            // erased every earlier contribution. With the widened deadband
-            // most subcycles take this branch, so the wipe dominated.
-            }
+            // Smooth deadband: the threshold value becomes band_a, and the
+            // dlamdaE term picks up band_a_der, which the hard branch left
+            // implicit at 1 inside each linear arm.
+            dThetadCC(30+II) += (local_dt/tau_lamdaP_a)*((dphifdotplusdCC(ii,jj)*band_a)
+                              + (phif_dot_plus*band_a_der*dlamdaE_a_dCC(ii,jj)));
             // lamdaP_s
-            if(lamdaE_s < lowlim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
-                dThetadCC(36+II) += (local_dt/tau_lamdaP_s)*((dphifdotplusdCC(ii,jj)*(lamdaE_s-lowlim)) + (phif_dot_plus*(dlamdaE_s_dCC(ii,jj))));
-            } else if(lamdaE_s > uplim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
-                dThetadCC(36+II) += (local_dt/tau_lamdaP_s)*((dphifdotplusdCC(ii,jj)*(lamdaE_s-uplim)) + (phif_dot_plus*(dlamdaE_s_dCC(ii,jj))));
-            } else{
-            // Inside the deadband this subcycle contributes nothing to the
-            // derivative. It must NOT be zeroed: dTheta* is accumulated with
-            // += across all time_step_ratio subcycles, so assigning 0 here
-            // erased every earlier contribution. With the widened deadband
-            // most subcycles take this branch, so the wipe dominated.
-            }
+            // Smooth deadband: the threshold value becomes band_s, and the
+            // dlamdaE term picks up band_s_der, which the hard branch left
+            // implicit at 1 inside each linear arm.
+            dThetadCC(36+II) += (local_dt/tau_lamdaP_s)*((dphifdotplusdCC(ii,jj)*band_s)
+                              + (phif_dot_plus*band_s_der*dlamdaE_s_dCC(ii,jj)));
             // lamdaP_n
-            if(lamdaE_n < lowlim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-                dThetadCC(42+II) += (local_dt/tau_lamdaP_n)*((dphifdotplusdCC(ii,jj)*(lamdaE_n-lowlim)) + (phif_dot_plus*(dlamdaE_n_dCC(ii,jj))));
-            } else if(lamdaE_n > uplim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-                dThetadCC(42+II) += (local_dt/tau_lamdaP_n)*((dphifdotplusdCC(ii,jj)*(lamdaE_n-uplim)) + (phif_dot_plus*(dlamdaE_n_dCC(ii,jj))));
-            } else{
-            // Inside the deadband this subcycle contributes nothing to the
-            // derivative. It must NOT be zeroed: dTheta* is accumulated with
-            // += across all time_step_ratio subcycles, so assigning 0 here
-            // erased every earlier contribution. With the widened deadband
-            // most subcycles take this branch, so the wipe dominated.
-            }
+            // Smooth deadband: the threshold value becomes band_n, and the
+            // dlamdaE term picks up band_n_der, which the hard branch left
+            // implicit at 1 inside each linear arm.
+            dThetadCC(42+II) += (local_dt/tau_lamdaP_n)*((dphifdotplusdCC(ii,jj)*band_n)
+                              + (phif_dot_plus*band_n_der*dlamdaE_n_dCC(ii,jj)));
 	    //for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
               //  double z_coord = myMesh.nodes[nodei](2);
                 //if(z_coord<1e-30){
@@ -555,41 +587,11 @@ void localWoundProblemExplicit(
 
         // Threshold
         // lamdaP_a
-        if(lamdaE_a < lowlim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-            dThetadrho(5) += local_dt*((lamdaE_a-lowlim)/tau_lamdaP_a)*dphifdotplusdrho;
-        } else if(lamdaE_a > uplim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-            dThetadrho(5) += local_dt*((lamdaE_a-uplim)/tau_lamdaP_a)*dphifdotplusdrho;
-        }else{
-            // Inside the deadband this subcycle contributes nothing to the
-            // derivative. It must NOT be zeroed: dTheta* is accumulated with
-            // += across all time_step_ratio subcycles, so assigning 0 here
-            // erased every earlier contribution. With the widened deadband
-            // most subcycles take this branch, so the wipe dominated.
-        }
+        dThetadrho(5) += local_dt*(band_a/tau_lamdaP_a)*dphifdotplusdrho;
         // lamdaP_s
-        if(lamdaE_s < lowlim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
-            dThetadrho(6) += local_dt*((lamdaE_s-lowlim)/tau_lamdaP_s)*dphifdotplusdrho;
-        } else if(lamdaE_s > uplim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
-            dThetadrho(6) += local_dt*((lamdaE_s-uplim)/tau_lamdaP_s)*dphifdotplusdrho;
-        } else{
-            // Inside the deadband this subcycle contributes nothing to the
-            // derivative. It must NOT be zeroed: dTheta* is accumulated with
-            // += across all time_step_ratio subcycles, so assigning 0 here
-            // erased every earlier contribution. With the widened deadband
-            // most subcycles take this branch, so the wipe dominated.
-        }
+        dThetadrho(6) += local_dt*(band_s/tau_lamdaP_s)*dphifdotplusdrho;
         // lamdaP_n
-        if(lamdaE_n < lowlim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-            dThetadrho(7) += local_dt*((lamdaE_n-lowlim)/tau_lamdaP_n)*dphifdotplusdrho;
-        } else if(lamdaE_n > uplim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-            dThetadrho(7) += local_dt*((lamdaE_n-uplim)/tau_lamdaP_n)*dphifdotplusdrho;
-        } else{
-            // Inside the deadband this subcycle contributes nothing to the
-            // derivative. It must NOT be zeroed: dTheta* is accumulated with
-            // += across all time_step_ratio subcycles, so assigning 0 here
-            // erased every earlier contribution. With the widened deadband
-            // most subcycles take this branch, so the wipe dominated.
-        }
+        dThetadrho(7) += local_dt*(band_n/tau_lamdaP_n)*dphifdotplusdrho;
 
 
 	//for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
@@ -643,41 +645,11 @@ void localWoundProblemExplicit(
 
         // Threshold
         // lamdaP_a
-        if(lamdaE_a < lowlim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-            dThetadc(5) += local_dt*((lamdaE_a-lowlim)/tau_lamdaP_a)*dphifdotplusdc;
-        } else if(lamdaE_a > uplim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-            dThetadc(5) += local_dt*((lamdaE_a-uplim)/tau_lamdaP_a)*dphifdotplusdc;
-        } else{
-            // Inside the deadband this subcycle contributes nothing to the
-            // derivative. It must NOT be zeroed: dTheta* is accumulated with
-            // += across all time_step_ratio subcycles, so assigning 0 here
-            // erased every earlier contribution. With the widened deadband
-            // most subcycles take this branch, so the wipe dominated.
-        }
+        dThetadc(5) += local_dt*(band_a/tau_lamdaP_a)*dphifdotplusdc;
         // lamdaP_s
-        if(lamdaE_s < lowlim){ // && (lamdaE_s < uplim && lamdaE_s > lowlim)
-            dThetadc(6) += local_dt*((lamdaE_s-lowlim)/tau_lamdaP_s)*dphifdotplusdc;
-        } else if(lamdaE_s > uplim){ // && (lamdaE_s < uplim && lamdaE_s > lowlim)
-            dThetadc(6) += local_dt*((lamdaE_s-uplim)/tau_lamdaP_s)*dphifdotplusdc;
-        } else{
-            // Inside the deadband this subcycle contributes nothing to the
-            // derivative. It must NOT be zeroed: dTheta* is accumulated with
-            // += across all time_step_ratio subcycles, so assigning 0 here
-            // erased every earlier contribution. With the widened deadband
-            // most subcycles take this branch, so the wipe dominated.
-        }
+        dThetadc(6) += local_dt*(band_s/tau_lamdaP_s)*dphifdotplusdc;
         // lamdaP_n
-        if(lamdaE_n < lowlim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-            dThetadc(7) += local_dt*((lamdaE_n-lowlim)/tau_lamdaP_n)*dphifdotplusdc;
-        } else if(lamdaE_n > uplim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-            dThetadc(7) += local_dt*((lamdaE_n-uplim)/tau_lamdaP_n)*dphifdotplusdc;
-        } else{
-            // Inside the deadband this subcycle contributes nothing to the
-            // derivative. It must NOT be zeroed: dTheta* is accumulated with
-            // += across all time_step_ratio subcycles, so assigning 0 here
-            // erased every earlier contribution. With the widened deadband
-            // most subcycles take this branch, so the wipe dominated.
-        }
+        dThetadc(7) += local_dt*(band_n/tau_lamdaP_n)*dphifdotplusdc;
 
 
 	/*for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
