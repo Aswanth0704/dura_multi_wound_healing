@@ -560,10 +560,15 @@ void localWoundProblemExplicit(
         dThetadrho(2) += local_dt*(((2.*PIE)/(tau_omega))*lamdamax*(Matrix3d::Identity()-a0a0)*(vectormax))(1)*dphifdotplusdrho;
         dThetadrho(3) += local_dt*(((2.*PIE)/(tau_omega))*lamdamax*(Matrix3d::Identity()-a0a0)*(vectormax))(2)*dphifdotplusdrho;
         dThetadrho(4) += local_dt*(1/tau_kappa)*( pow(lamdamed/lamdamax,gamma_kappa)/3. - kappa)*dphifdotplusdrho;
-        // No threshold
-        dThetadrho(5) += local_dt*((lamdaE_a-1)/tau_lamdaP_a)*dphifdotplusdrho;
-        dThetadrho(6) += local_dt*((lamdaE_s-1)/tau_lamdaP_s)*dphifdotplusdrho;
-        dThetadrho(7) += local_dt*((lamdaE_n-1)/tau_lamdaP_n)*dphifdotplusdrho;
+        // NOTE: an un-thresholded (lamdaE - 1) contribution used to be added to
+        // slots 5..7 here, on top of the thresholded one added below - so every
+        // subcycle accumulated the derivative TWICE, and the two terms were not
+        // even the same function. The residual uses
+        //     lamdaP_dot = phif_dot_plus * band(lamdaE) / tau
+        // and band() is zero inside the tolerance range while (lamdaE - 1) is
+        // not, so the stray term claimed a sensitivity to growth that was not
+        // occurring at all. Healthy tissue sits at lamdaE = (1.098, 1.035,
+        // 0.880), i.e. (lamdaE - 1) of up to 0.12 against a band value of 0.
 
 //        // Threshold
 //        // lamdaP_a
@@ -618,10 +623,15 @@ void localWoundProblemExplicit(
         dThetadc(2) += local_dt*(((2.*PIE)/(tau_omega))*lamdamax*(Matrix3d::Identity()-a0a0)*(vectormax))(1)*dphifdotplusdc;
         dThetadc(3) += local_dt*(((2.*PIE)/(tau_omega))*lamdamax*(Matrix3d::Identity()-a0a0)*(vectormax))(2)*dphifdotplusdc;
         dThetadc(4) += local_dt*(1/tau_kappa)*( pow(lamdamed/lamdamax,gamma_kappa)/3. - kappa)*dphifdotplusdc;
-        // No threshold
-        dThetadc(5) += local_dt*((lamdaE_a-1)/tau_lamdaP_a)*dphifdotplusdc;
-        dThetadc(6) += local_dt*((lamdaE_s-1)/tau_lamdaP_s)*dphifdotplusdc;
-        dThetadc(7) += local_dt*((lamdaE_n-1)/tau_lamdaP_n)*dphifdotplusdc;
+        // NOTE: an un-thresholded (lamdaE - 1) contribution used to be added to
+        // slots 5..7 here, on top of the thresholded one added below - so every
+        // subcycle accumulated the derivative TWICE, and the two terms were not
+        // even the same function. The residual uses
+        //     lamdaP_dot = phif_dot_plus * band(lamdaE) / tau
+        // and band() is zero inside the tolerance range while (lamdaE - 1) is
+        // not, so the stray term claimed a sensitivity to growth that was not
+        // occurring at all. Healthy tissue sits at lamdaE = (1.098, 1.035,
+        // 0.880), i.e. (lamdaE - 1) of up to 0.12 against a band value of 0.
 
 //        // Threshold
 //        // lamdaP_a
