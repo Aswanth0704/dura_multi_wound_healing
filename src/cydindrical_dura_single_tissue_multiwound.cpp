@@ -38,6 +38,7 @@
     WOUND_TOL_INC   Newton tolerance on the increment norm (limit-cycle escape)
     WOUND_TRHO      active traction t_rho [MPa]; t_rho_c follows at 3.28571x
     WOUND_BANDW     smoothing width of the plastic-growth deadband edges
+    WOUND_KCUT      steepness of the low-collagen gate in D_rho (default 300)
 */
 
 #include <omp.h>

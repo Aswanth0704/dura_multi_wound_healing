@@ -9,6 +9,7 @@
 #define diffusivity_h
 
 #include <cmath>
+#include <cstdlib>
 
 //--------------------------------------------------------//
 // FIBROBLAST DIFFUSIVITY  D_rho(phif)
@@ -37,6 +38,24 @@
 //   phi   0.01      0.02      0.05      0.19(peak)  1.00
 //   D_rho 2.32e-4   1.31e-3   6.00e-3   2.12e-2     6.12e-5
 //
+// Steepness of the low-collagen gate, overridable via WOUND_KCUT.
+//
+// At the default 300 this gate is very nearly a step: C_low runs
+// 0.0025 -> 0.5 -> 0.9975 across phi = 0 -> 0.01 -> 0.02, with dC_low/dphi
+// peaking at 150. A near-step in a coefficient of the transport operator is a
+// candidate for the residual floor the healing runs stall against - Newton sees
+// an almost-discontinuous system matrix wherever collagen sits near phi_cut.
+// Lowering k_cut widens the transition without moving its midpoint, so a sweep
+// says whether this gate is what limits convergence.
+inline double drhoKcut()
+{
+    static const double v = [](){
+        const char* e = std::getenv("WOUND_KCUT");
+        return e ? std::atof(e) : 300.0;
+    }();
+    return v;
+}
+
 inline double evalDrho(double phif, double c)
 {
     (void)c; // no chemotactic dependence in this form
@@ -47,7 +66,7 @@ inline double evalDrho(double phif, double c)
     const double C   =   875.66;
     const double D   =  -521.57;
     const double E   =   118.9;
-    const double k_cut   = 300.0;
+    const double k_cut   = drhoKcut();
     const double phi_cut = 1e-2;
     const double D_floor = 6.12e-5;
 
