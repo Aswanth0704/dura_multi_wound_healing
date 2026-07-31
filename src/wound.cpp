@@ -696,7 +696,12 @@ void evalWound(
         // then use the derivatives dThetadCC, dThetadrho, dThetadc
         // derivative wrt to CC is done analytically
         //
-        double epsilon = 1e-7;
+        // Step for the central-difference structural sensitivities. Overridable
+        // (WOUND_FDEPS) so the tangent error can be tested for dependence on it:
+        // if the residual Ke_x_x error moves with this, the finite differencing
+        // is the limit; if it sits still, a term is wrong.
+        static const double epsilon = [](){ const char* e = std::getenv("WOUND_FDEPS");
+                                            return e ? std::atof(e) : 1e-7; }();
         //
         // structural parameters
         double phif_plus = phif + epsilon;

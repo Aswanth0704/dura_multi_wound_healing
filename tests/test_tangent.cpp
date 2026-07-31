@@ -53,6 +53,10 @@ static const int NDIM  = 3;
 // tangent describes the CONTINUOUS remodelling law while the residual evaluates
 // the DISCRETISED one, so if that gap is the cause the error should shrink as
 // the substeps are refined, and sit still if a term is genuinely missing.
+// Switches to isolate which stress contribution carries a tangent error, by
+// parameter rather than by editing the kernel.
+static bool envOn(const char* k){ const char* e = std::getenv(k); return e && *e && *e != '0'; }
+
 static double substeps()
 {
     const char* e = std::getenv("TANGENT_SUBSTEPS");
@@ -69,8 +73,11 @@ static void buildParameters(std::vector<double>& gp, std::vector<double>& lp)
     // regime it reproduces.
     const double rho_h = 1.0, c_h = 1.0, phi_h = 1.0, H_h = 0.5;
 
-    const double k0 = 0.02, kf = 40.0, k2 = 0.048;
-    const double t_rho = 1.28571e-3, t_rho_c = t_rho*3.28571;
+    const double k0 = envOn("TANGENT_NOVOL") ? 0.0 : 0.02;
+    const double kf = envOn("TANGENT_NOFIB") ? 0.0 : 40.0;
+    const double k2 = 0.048;
+    const double t_rho = envOn("TANGENT_NOACT") ? 0.0 : 1.28571e-3;
+    const double t_rho_c = t_rho*3.28571;
     const double K_t = 0.2, K_t_c = c_h/10.0;
     const double D_rhorho = 0.0, D_rhoc = 0.0, D_cc = 0.00930;
     const double p_rho = 0.0154, p_rho_c = 1.48*p_rho, p_rho_theta = 0.109*p_rho;
@@ -89,8 +96,11 @@ static void buildParameters(std::vector<double>& gp, std::vector<double>& lp)
            vartheta_e, gamma_theta, p_c_rho, p_c_thetaE, K_c_c, d_c,
            0.0, 0.0, 0.0, D_alpha, d_alpha, p_c_alpha };
 
-    const double p_phi = 9.34e-4, p_phi_c = 1.41e-3, p_phi_theta = 4.96*p_phi;
-    const double K_phi_c = 1.08, d_phi = 2.02e-3, d_phi_rho_c = 2.87e-4;
+    // NOSTRUCT freezes the structural update, so dphif/da0/dkappa/dlamdaP with
+    // respect to CC all vanish and DDstruct drops out of Ke_x_x.
+    const double fz = envOn("TANGENT_NOSTRUCT") ? 0.0 : 1.0;
+    const double p_phi = fz*9.34e-4, p_phi_c = fz*1.41e-3, p_phi_theta = 4.96*p_phi;
+    const double K_phi_c = 1.08, d_phi = fz*2.02e-3, d_phi_rho_c = fz*2.87e-4;
     const double K_phi_rho = deriveKphirho(p_phi, p_phi_c, p_phi_theta, K_phi_c,
                                            d_phi, d_phi_rho_c, c_h, rho_h, phi_h, H_h);
     const double tau_omega = 10.0/(K_phi_rho+1.0);
