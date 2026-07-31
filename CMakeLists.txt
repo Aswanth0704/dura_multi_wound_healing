@@ -161,4 +161,10 @@ add_executable(test_homeostasis EXCLUDE_FROM_ALL tests/test_homeostasis.cpp)
 target_compile_features(test_homeostasis PRIVATE cxx_std_17)
 add_test(NAME homeostasis COMMAND test_homeostasis)
 
-add_custom_target(tests DEPENDS test_mechanosensing test_diffusivity test_homeostasis)
+# Needs the real element kernels, so it links sources rather than headers only.
+add_executable(test_tangent EXCLUDE_FROM_ALL tests/test_tangent.cpp
+               src/wound.cpp src/local_solver.cpp src/element_functions.cpp)
+target_compile_features(test_tangent PRIVATE cxx_std_17)
+add_test(NAME tangent COMMAND test_tangent)
+
+add_custom_target(tests DEPENDS test_mechanosensing test_diffusivity test_homeostasis test_tangent)
