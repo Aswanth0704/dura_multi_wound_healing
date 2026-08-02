@@ -397,9 +397,22 @@ int main(int argc, char *argv[])
     // permanent contracture/growth. NOTE: unlike tau_omega/tau_kappa these are
     // NOT co-scaled with K_phi_rho, so the plastic growth rate moves with the
     // renormalization. Revisit if lamdaP misbehaves.
-    double tau_lamdaP_a = 0.05;
-    double tau_lamdaP_s = 0.05;
-    double tau_lamdaP_n = 0.05;
+    // Plastic-growth time constants. WOUND_TAULAMP scales all three.
+    //
+    // SUSPECT VALUE. tau_lamdaP = 0.05 against tau_omega = 5.87 is a 117x gap,
+    // and CLAUDE.md records that tau_omega/tau_kappa WERE co-scaled during the
+    // normalization while tau_lamdaP_* were NOT. 0.05 h implies plastic collagen
+    // remodelling with a three-minute time constant, which is wrong by orders of
+    // magnitude - real remodelling takes days. This is the term driving the
+    // lamdaP -> 0 runaway that removes elements from the stiffness matrix.
+    //
+    // Default is left at 0.05 so nothing shifts silently; sweep it to find out
+    // what it should be, then derive the correct value from plan.md's
+    // calibration rather than adopting whichever number happens to run.
+    const double tau_lamdaP_scale = env_dbl("WOUND_TAULAMP", 1.0);
+    double tau_lamdaP_a = 0.05*tau_lamdaP_scale;
+    double tau_lamdaP_s = 0.05*tau_lamdaP_scale;
+    double tau_lamdaP_n = 0.05*tau_lamdaP_scale;
 
     double tol_local = 1e-8;        // inert in the explicit local solver
     // Local substeps per global step. The binding local timescale is
@@ -568,37 +581,155 @@ int main(int argc, char *argv[])
              <<" lam_thick="<<1.0/(lam_z*lam_th)
              <<"  -> theta_e="<<lam_z*lam_th<<"\n";
 
-    // Wound bounds in the DEFORMED frame.
+    // WOUND MEMBERSHIP IS DECIDED ONCE, IN THE REFERENCE CONFIGURATION.
     //
-    // The wound is seeded after settling and its membership test runs on
-    // myTissue.node_x - deliberately, because the puncture is made in vivo.
-    // The bounds must therefore live in the same frame. Using the reference
-    // limits here (as this used to) produced three coupled errors, all
-    // measured from w_WOUNDCHECK.vtk:
+    // Everything below tags node and integration-point IDs on the undeformed
+    // mesh - exactly the way on_boundary[] is built - and stores a severity per
+    // ID. Seeding, the free patch and any later re-seed then look up those IDs.
+    // Nothing re-derives geometry in the deformed frame.
     //
-    //   1. z_center = 5.0 is the REFERENCE mid-length, but the settled mesh
-    //      spans z in [0, 10.98], so its mid-length is 5.49. Testing deformed
-    //      z against 5.0 put the wound at reference z = 4.554 - off the
-    //      refined patch this mesh carries at z = 5.0 (549 nodes within
-    //      +-0.25 mm instead of 1536).
-    //   2. Xmin_wound = -(r_cord+t_dura) = -5.4 is the REFERENCE outer radius,
-    //      while the settled outer surface sits at -5.55799. Every node beyond
-    //      r = 5.4 failed the test, so the needle track pierced only the inner
-    //      55% of the wall - a partial-thickness lesion, not a puncture.
-    //   3. The free patch below tests myMesh.nodes (reference) against the same
-    //      z_center, so patch and wound ended up 0.45 mm apart and the
-    //      contraction boundary was asymmetric about the track.
+    // This replaces a deformed-frame membership test that mapped the reference
+    // limits through the prestretch. That approach produced FOUR separate bugs:
     //
-    // Mapping the reference limits through the same prestretch fixes all three.
-    const double lam_r_pre  = 1.0/(lam_z*lam_th);
-    const double r_in_def   = r_mid*lam_th + (r_cord          - r_mid)*lam_r_pre;
-    const double r_out_def  = r_mid*lam_th + (r_cord + t_dura - r_mid)*lam_r_pre;
-    const double z_center_def = z_center*lam_z;
-    const double Xmin_wound = -r_out_def - tol_boundary;
-    const double Xmax_wound = -r_in_def  + 0.01;
-    std::cout<<"wound bounds (deformed frame): x in ["<<Xmin_wound<<", "
-             <<Xmax_wound<<"], z_center "<<z_center_def
-             <<" (reference "<<z_center<<")\n";
+    //   1. z_center = 5.0 is the reference mid-length but the settled mesh spans
+    //      z in [0, 10.98], so testing deformed z against 5.0 put the wound at
+    //      reference z = 4.554, off the refined patch (549 nodes instead of 1536).
+    //   2. Xmin_wound = -(r_cord+t_dura) = -5.4 is the reference outer radius
+    //      while the settled outer surface is at -5.55799, so the track pierced
+    //      only the inner 55% of the wall.
+    //   3. The free patch tested REFERENCE coordinates against the same
+    //      z_center, leaving patch and wound 0.45 mm apart.
+    //   4. WOUND_NOPRESTRETCH left the bounds mapped through lam_z = 1.098, so
+    //      the wound centre sat at 5.49 while the tissue was at 5.0 - a 0.49 mm
+    //      offset against a 0.25 mm radius. Runs a10/a11 seeded almost no wound
+    //      (alpha_w = 0.061 instead of 0.330) and "succeeded" for that reason,
+    //      which invalidated a whole 2x2 conclusion.
+    //
+    // Reference-frame IDs are immune to all four, and to any later change in
+    // prestretch magnitude, settling duration or boundary conditions.
+    //
+    // The coverage report below also makes a mesh limitation visible that the
+    // coordinate test silently hid: on dura_cyl_repeated_wound_v62_2t_finer the
+    // refined needle-track column spans only r = 5.30 to 5.45 of a 5.206-5.558
+    // wall, so NO membership test can produce a full-thickness puncture on this
+    // mesh. That is a property of the mesh, not of the test, and it needs to be
+    // printed rather than inferred later from field data.
+    const bool no_prestretch = (std::getenv("WOUND_NOPRESTRETCH") != nullptr);
+
+    // Element size, measured on the REFERENCE mesh.
+    //
+    // Reported both globally and LOCALLY near the wound, because this mesh is
+    // strongly graded (measured: 0.0587 mm within 0.5 mm of the track against
+    // 0.556 mm in the far field) and it is the local size that sets a meaningful
+    // smoothing width. The previous version averaged the first 4000 elements,
+    // which reported 0.0886 against a true global mean of 0.2655 - it happened
+    // to land near the local size only because of element ordering, and the
+    // under-resolution warning that compared against it could never fire.
+    double mean_edge_global = 0.0, mean_edge_local = 0.0;
+    {
+        long ng = 0, nl = 0;
+        for(int e=0;e<myMesh.n_elements;e++){
+            const std::vector<int>& el = myMesh.elements[e];
+            Vector3d cen = Vector3d::Zero();
+            for(size_t a=0;a<el.size();a++) cen += myMesh.nodes[el[a]];
+            cen /= (double)el.size();
+            const double d = std::sqrt((cen(1)-y_center)*(cen(1)-y_center)
+                                     + (cen(2)-z_center)*(cen(2)-z_center));
+            const bool near = (d < 4.0*r_wound) && (cen(0) < 0.0);
+            for(size_t a=0;a<el.size();a++)
+                for(size_t b=a+1;b<el.size();b++){
+                    const double L = (myMesh.nodes[el[a]] - myMesh.nodes[el[b]]).norm();
+                    mean_edge_global += L; ng++;
+                    if(near){ mean_edge_local += L; nl++; }
+                }
+        }
+        if(ng) mean_edge_global /= (double)ng;
+        mean_edge_local = nl ? mean_edge_local/(double)nl : mean_edge_global;
+    }
+    const double w_smooth_ref = env_dbl("WOUND_WSMOOTH", 1.7*mean_edge_local);
+    std::cout<<"element edge: global mean "<<mean_edge_global
+             <<" mm, local (within 4 r_wound of the track) "<<mean_edge_local<<" mm\n"
+             <<"wound radius "<<r_wound<<" mm = "<<r_wound/mean_edge_local
+             <<" local elements; smoothing width "<<w_smooth_ref
+             <<" mm = "<<w_smooth_ref/mean_edge_local<<" local elements\n";
+    if(w_smooth_ref < 1.2*mean_edge_local)
+        std::cout<<"  *** WARNING: smoothing width under-resolved against the LOCAL"
+                   " element size; expect Galerkin undershoot at the wound edge ***\n";
+
+    // Severity of the needle track at a REFERENCE position. The track axis is
+    // the line (y = y_center, z = z_center) running radially through the wall,
+    // so distance from the axis is measured in the (y,z) plane and wall
+    // membership is a plain radius test. No prestretch enters anywhere.
+    auto severity_ref = [&](const Vector3d& X)->double{
+        if(X(0) > 0.0) return 0.0;                       // track is on the -x side
+        const double r = std::sqrt(X(0)*X(0) + X(1)*X(1));
+        if(r < r_cord - tol_boundary || r > r_cord + t_dura + tol_boundary)
+            return 0.0;
+        const double d = std::sqrt((X(1)-y_center)*(X(1)-y_center)
+                                 + (X(2)-z_center)*(X(2)-z_center));
+        return 0.5*(1.0 - std::tanh((d - r_wound)/w_smooth_ref));
+    };
+
+    // Tag wound nodes and integration points ONCE, on the reference mesh.
+    // These arrays are the single source of truth for everything downstream:
+    // seeding, the free patch, and any re-seed. Nothing recomputes geometry.
+    std::vector<double> wound_sev_node(myMesh.n_nodes, 0.0);
+    std::vector<double> wound_sev_ip(myMesh.n_elements*IP_size, 0.0);
+    std::vector<int>    wound_node_ids;
+    {
+        double r_lo = 1e30, r_hi = -1e30, d_lo = 1e30, d_hi = -1e30;
+        double wall_lo = 1e30, wall_hi = -1e30;
+        for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
+            const Vector3d& X = myMesh.nodes[nodei];
+            const double r = std::sqrt(X(0)*X(0)+X(1)*X(1));
+            wall_lo = std::min(wall_lo, r); wall_hi = std::max(wall_hi, r);
+            const double sev = severity_ref(X);
+            wound_sev_node[nodei] = sev;
+            if(sev > 0.5){
+                wound_node_ids.push_back(nodei);
+                r_lo = std::min(r_lo, r); r_hi = std::max(r_hi, r);
+                const double d = std::sqrt((X(1)-y_center)*(X(1)-y_center)
+                                         + (X(2)-z_center)*(X(2)-z_center));
+                d_lo = std::min(d_lo, d); d_hi = std::max(d_hi, d);
+            }
+        }
+        int n_ip_core = 0;
+        for(int elemi=0;elemi<myMesh.n_elements;elemi++){
+            for(int ip=0;ip<IP_size;ip++){
+                std::vector<double> R;
+                const double xi=IP[ip](0), eta=IP[ip](1), zeta=IP[ip](2);
+                if(elem_size == 8)       R = evalShapeFunctionsR(xi,eta,zeta);
+                else if(elem_size == 20) R = evalShapeFunctionsQuadraticR(xi,eta,zeta);
+                else if(elem_size == 27) R = evalShapeFunctionsQuadraticLagrangeR(xi,eta,zeta);
+                else if(elem_size == 4)  R = evalShapeFunctionsTetR(xi,eta,zeta);
+                else                     R = evalShapeFunctionsTetQuadraticR(xi,eta,zeta);
+                Vector3d X_IP = Vector3d::Zero();
+                for(int nodej=0;nodej<elem_size;nodej++)
+                    X_IP += R[nodej]*myMesh.nodes[myMesh.elements[elemi][nodej]];
+                const double sev = severity_ref(X_IP);
+                wound_sev_ip[elemi*IP_size+ip] = sev;
+                if(sev > 0.5) n_ip_core++;
+            }
+        }
+        const double cover = (wall_hi > wall_lo && r_hi > r_lo)
+                           ? 100.0*(r_hi-r_lo)/(wall_hi-wall_lo) : 0.0;
+        std::cout<<"\nwound tagged on the REFERENCE mesh: "<<wound_node_ids.size()
+                 <<" nodes, "<<n_ip_core<<" integration points (severity > 0.5)\n"
+                 <<"  track axis      : y="<<y_center<<", z="<<z_center
+                 <<" , radial (-x), r_wound="<<r_wound<<" mm\n"
+                 <<"  distance to axis: "<<d_lo<<" to "<<d_hi<<" mm\n"
+                 <<"  radial span     : "<<r_lo<<" to "<<r_hi<<" mm\n"
+                 <<"  wall spans      : "<<wall_lo<<" to "<<wall_hi
+                 <<" mm  ->  THICKNESS COVERED "<<cover<<"%\n";
+        if(cover < 90.0)
+            std::cout<<"  *** WARNING: this is a PARTIAL-THICKNESS lesion, not a puncture.\n"
+                     <<"      The mesh has no nodes near the track axis over the full wall,\n"
+                     <<"      so no membership test can produce full-thickness damage here.\n"
+                     <<"      Fix the MESH (refine the track column through both surfaces),\n"
+                     <<"      not the seeding logic. ***\n";
+        if(wound_node_ids.empty())
+            throw std::runtime_error("no wound nodes tagged - check r_wound, y_center, z_center");
+    }
 
     // Identify the outer boundary: the two end rings (already flagged by
     // readCOMSOLInput via z) plus the inner and outer lateral surfaces, which
@@ -621,9 +752,23 @@ int main(int argc, char *argv[])
              <<" on lateral surfaces\n";
 
     // Prestretched target position for every node, and the initial guess.
+    //
+    // WOUND_NOPRESTRETCH: target = reference, so F = I entering healing and the
+    // shell carries no stored elastic energy for the puncture to release.
+    // Diagnostic only - see the warning printed below. The flag itself is read
+    // further up, because the wound-placement bounds depend on it.
     std::vector<Vector3d> node_target(myMesh.n_nodes);
     for(int nodei=0;nodei<myMesh.n_nodes;nodei++)
-        node_target[nodei] = prestretch_target(myMesh.nodes[nodei], r_mid, lam_th, lam_z);
+        node_target[nodei] = no_prestretch
+                           ? myMesh.nodes[nodei]
+                           : prestretch_target(myMesh.nodes[nodei], r_mid, lam_th, lam_z);
+    if(no_prestretch){
+        std::cout<<"\n*** WOUND_NOPRESTRETCH: prestretch DISABLED (target = reference) ***\n"
+                 <<"    theta_e = 1 so H = 0.204, not the 0.5 that K_rho_rho, K_phi_rho and\n"
+                 <<"    p_c_rho are all derived from. (0,1,1,1) is therefore NOT a fixed\n"
+                 <<"    point and the far field WILL drift. This is a convergence test,\n"
+                 <<"    not a correctness test - do not read healing behaviour from it.\n\n";
+    }
 
     //=======================================================================//
     // INITIAL CONDITIONS - healthy everywhere (the wound comes in phase 2)
@@ -636,8 +781,8 @@ int main(int argc, char *argv[])
     Vector3d a0_healthy(0.,0.,1.);            // collagen along the axis
     Vector3d lamda0_healthy(1.,1.,1.);
     std::vector<Vector3d> ip_a00(myMesh.n_elements*IP_size, a0_healthy);
-    std::vector<Vector3d> ip_s00(myMesh.n_elements*IP_size, Vector3d(1.,0.,0.));
-    std::vector<Vector3d> ip_n00(myMesh.n_elements*IP_size, Vector3d(0.,1.,0.));
+    std::vector<Vector3d> ip_s00(myMesh.n_elements*IP_size, Vector3d(1.,0.,0.)); // Okay this is corrected in the next step
+    std::vector<Vector3d> ip_n00(myMesh.n_elements*IP_size, Vector3d(0.,1.,0.)); // Okay this is corrected in the next step
     std::vector<Vector3d> ip_lamda0(myMesh.n_elements*IP_size, lamda0_healthy);
 
     // Cylindrical fiber frame at every integration point.
@@ -807,17 +952,41 @@ int main(int argc, char *argv[])
     {
         std::map<int,double> eBC_x2, eBC_rho2, eBC_c2, eBC_alpha2;
         int n_freed = 0;
+
+        // WOUND_FREEZEX: prescribe x on EVERY node, so the mechanics block
+        // leaves the global system entirely and only the three transport fields
+        // are solved on a fixed deformed mesh. This is the control for the
+        // volumetric-collapse diagnosis: with the geometry frozen no element can
+        // collapse further, so if the run still stalls at ~16.8 h the cause is
+        // not mechanical and the diagnosis is wrong.
+        //
+        // Combined with the default (prestretched) path this freezes the tissue
+        // at theta_e = 1.136 / H = 0.5, i.e. the exact homeostatic fixed point,
+        // so the far field remains interpretable - unlike WOUND_NOPRESTRETCH.
+        const bool freeze_x = (std::getenv("WOUND_FREEZEX") != nullptr);
+        if(freeze_x){
+            for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
+                const Vector3d& xf = myTissue.node_x[nodei];   // settled position
+                eBC_x2.insert(std::pair<int,double>(nodei*3+0, xf(0)));
+                eBC_x2.insert(std::pair<int,double>(nodei*3+1, xf(1)));
+                eBC_x2.insert(std::pair<int,double>(nodei*3+2, xf(2)));
+            }
+            std::cout<<"\n*** WOUND_FREEZEX: all "<<myMesh.n_nodes<<" nodal displacements pinned"
+                     <<" at the settled configuration ***\n"
+                     <<"    The x-block is fully constrained; only rho, c and alpha are solved.\n"
+                     <<"    The wound cannot contract and no element can collapse further.\n\n";
+        }
+
         for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
             if(!on_boundary[nodei]) continue;
-            // Distance from the needle track, measured in the plane normal to
-            // the track axis (which runs along x). Measured on the SETTLED
-            // geometry against the same deformed-frame centre the wound
-            // seeding uses, so the patch is concentric with the puncture -
-            // testing reference coordinates here while seeding on deformed
-            // ones left the two 0.45 mm apart.
-            const Vector3d& X = myTissue.node_x[nodei];
+            // Distance from the needle track, in the plane normal to the track
+            // axis. Measured on the REFERENCE mesh against the same y_center /
+            // z_center the wound tagging used, so patch and puncture are
+            // concentric by construction. Mixing frames here (reference for the
+            // patch, deformed for the wound) is what left the two 0.45 mm apart.
+            const Vector3d& X = myMesh.nodes[nodei];
             const double d2 = (X(1)-y_center)*(X(1)-y_center)
-                            + (X(2)-z_center_def)*(X(2)-z_center_def);
+                            + (X(2)-z_center)*(X(2)-z_center);
             const bool near_wound = (d2 < patch_radius*patch_radius) && (X(0) < 0.0);
             if(near_wound){ n_freed++; continue; }
             eBC_x2.insert(std::pair<int,double>(nodei*3+0, node_target[nodei](0)));
@@ -862,41 +1031,17 @@ int main(int argc, char *argv[])
     // first attempt used a fixed 0.06 mm, which on this mesh is only 0.67 of an
     // element edge (0.089 mm) and still produced undershoot. Scale it from the
     // actual element size instead, so it travels across meshes.
-    double mean_edge = 0.0;
-    {
-        long ne = 0;
-        const int nsample = std::min(myMesh.n_elements, 4000);
-        for(int e=0;e<nsample;e++){
-            const std::vector<int>& el = myMesh.elements[e];
-            for(size_t a=0;a<el.size();a++)
-                for(size_t b=a+1;b<el.size();b++){
-                    mean_edge += (myMesh.nodes[el[a]] - myMesh.nodes[el[b]]).norm();
-                    ne++;
-                }
-        }
-        if(ne) mean_edge /= (double)ne;
-    }
-    const double w_smooth = env_dbl("WOUND_WSMOOTH", 1.7*mean_edge);   // [mm]
-    std::cout<<"mean element edge "<<mean_edge<<" mm; wound radius "<<r_wound
-             <<" mm ("<<r_wound/mean_edge<<" elements); smoothing width "
-             <<w_smooth<<" mm ("<<w_smooth/mean_edge<<" elements)\n";
-    if(w_smooth < 1.2*mean_edge)
-        std::cout<<"  *** WARNING: smoothing width under-resolved; expect "
-                   "Galerkin undershoot at the wound edge ***\n";
-    // x is a DEFORMED position, so every bound here is a deformed-frame one.
-    auto severity = [&](const Vector3d& x){
-        if(x(0) < Xmin_wound || x(0) > Xmax_wound) return 0.0;
-        const double r = std::sqrt((x(1)-y_center)*(x(1)-y_center)
-                                 + (x(2)-z_center_def)*(x(2)-z_center_def));
-        return 0.5*(1.0 - std::tanh((r - r_wound)/w_smooth));
-    };
+    // Seeding consumes the severities tagged on the REFERENCE mesh far above.
+    // No geometry is recomputed here, so the settled/deformed configuration -
+    // and therefore WOUND_NOPRESTRETCH, the settling duration, and the
+    // prestretch magnitude - cannot move the wound.
     auto blend = [](double healthy, double wound, double sev){
         return healthy + sev*(wound - healthy);
     };
 
     int n_wound_nodes = 0, n_wound_ip = 0;
     for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
-        const double sev = severity(myTissue.node_x[nodei]);
+        const double sev = wound_sev_node[nodei];
         if(sev > 1e-3){
             if(verbose) std::cout << "wound node " << nodei << " sev " << sev << "\n";
             const double r = blend(rho_healthy,   rho_wound,   sev);
@@ -908,37 +1053,66 @@ int main(int argc, char *argv[])
             if(sev > 0.5) n_wound_nodes++;
         }
     }
-    for(int elemi=0;elemi<myMesh.n_elements;elemi++){
-        for(int ip=0;ip<IP_size;ip++){
-            std::vector<double> R;
-            const double xi=IP[ip](0), eta=IP[ip](1), zeta=IP[ip](2);
-            if(elem_size == 8)       R = evalShapeFunctionsR(xi,eta,zeta);
-            else if(elem_size == 20) R = evalShapeFunctionsQuadraticR(xi,eta,zeta);
-            else if(elem_size == 27) R = evalShapeFunctionsQuadraticLagrangeR(xi,eta,zeta);
-            else if(elem_size == 4)  R = evalShapeFunctionsTetR(xi,eta,zeta);
-            else                     R = evalShapeFunctionsTetQuadraticR(xi,eta,zeta);
-            Vector3d x_IP = Vector3d::Zero();
-            for(int nodej=0;nodej<elem_size;nodej++)
-                x_IP += R[nodej]*myTissue.node_x[myMesh.elements[elemi][nodej]];
-            const double sev = severity(x_IP);
-            if(sev > 1e-3){
+    // Integration-point seeding, factored so it can be RE-APPLIED at increasing
+    // severity (see WOUND_SEVRAMP below). `frac` scales the severity profile:
+    // frac = 0 leaves healthy tissue, frac = 1 is the full puncture.
+    auto seed_ip = [&](double frac, bool count){
+        for(int elemi=0;elemi<myMesh.n_elements;elemi++){
+            for(int ip=0;ip<IP_size;ip++){
+                std::vector<double> R;
+                const double xi=IP[ip](0), eta=IP[ip](1), zeta=IP[ip](2);
+                if(elem_size == 8)       R = evalShapeFunctionsR(xi,eta,zeta);
+                else if(elem_size == 20) R = evalShapeFunctionsQuadraticR(xi,eta,zeta);
+                else if(elem_size == 27) R = evalShapeFunctionsQuadraticLagrangeR(xi,eta,zeta);
+                else if(elem_size == 4)  R = evalShapeFunctionsTetR(xi,eta,zeta);
+                else                     R = evalShapeFunctionsTetQuadraticR(xi,eta,zeta);
                 const int g = elemi*IP_size+ip;
-                if(verbose) std::cout<<"IP node: "<<g<<" sev "<<sev<<"\n";
-                Vector3d a0,s0,n0;
-                build_cylinder_frame(x_IP, a0_healthy, 0.0, 0.0, a0, s0, n0);
-                const double ph = blend(phif0_healthy,  phif0_wound,  sev);
-                const double kp = blend(kappa0_healthy, kappa0_wound, sev);
-                myTissue.ip_phif_0[g] = ph;  myTissue.ip_phif[g] = ph;
-                myTissue.ip_a0_0[g]   = a0;  myTissue.ip_a0[g]   = a0;
-                myTissue.ip_s0_0[g]   = s0;  myTissue.ip_s0[g]   = s0;
-                myTissue.ip_n0_0[g]   = n0;  myTissue.ip_n0[g]   = n0;
-                myTissue.ip_kappa_0[g]= kp;  myTissue.ip_kappa[g]= kp;
-                if(sev > 0.5) n_wound_ip++;
+                // Severity comes from the REFERENCE-frame tag, not from the
+                // current geometry. The deformed position is still needed for
+                // the cylindrical fibre frame, which is a genuine function of
+                // where the material sits now.
+                Vector3d x_IP = Vector3d::Zero();
+                for(int nodej=0;nodej<elem_size;nodej++)
+                    x_IP += R[nodej]*myTissue.node_x[myMesh.elements[elemi][nodej]];
+                const double sev = frac*wound_sev_ip[g];
+                if(sev > 1e-3){
+                    if(verbose && count) std::cout<<"IP node: "<<g<<" sev "<<sev<<"\n";
+                    Vector3d a0,s0,n0;
+                    build_cylinder_frame(x_IP, a0_healthy, 0.0, 0.0, a0, s0, n0);
+                    const double ph = blend(phif0_healthy,  phif0_wound,  sev);
+                    const double kp = blend(kappa0_healthy, kappa0_wound, sev);
+                    myTissue.ip_phif_0[g] = ph;  myTissue.ip_phif[g] = ph;
+                    myTissue.ip_a0_0[g]   = a0;  myTissue.ip_a0[g]   = a0;
+                    myTissue.ip_s0_0[g]   = s0;  myTissue.ip_s0[g]   = s0;
+                    myTissue.ip_n0_0[g]   = n0;  myTissue.ip_n0[g]   = n0;
+                    myTissue.ip_kappa_0[g]= kp;  myTissue.ip_kappa[g]= kp;
+                    if(count && sev > 0.5) n_wound_ip++;
+                }
             }
         }
-    }
+    };
+
+    // WOUND_SEVRAMP: number of severity continuation rungs (0 = off, legacy).
+    //
+    // The 2x2 control experiment (run_a09/a10/a11 vs the prestretched
+    // deformable fan) showed the solver fails only when BOTH prestretch and
+    // deformable mechanics are active. Freeze the geometry: completes in 52
+    // min. Remove the prestretch: completes with zero rejects. Keep both: every
+    // configuration stalls between t = 1 h and t = 21 h, with the tangent going
+    // near-singular (a direct factorization returning an 11 mm increment on a
+    // 0.089 mm mesh, residual 1e+12) rather than any element inverting.
+    //
+    // That is a LOAD-RELEASE problem: the prestretched shell stores elastic
+    // energy and the puncture dumps it instantaneously into a region whose
+    // stiffness just fell ~100x. The standard remedy is continuation on the
+    // load parameter - here the wound severity itself. Only phif and kappa are
+    // ramped: they carry the stiffness collapse. rho, c and alpha are seeded at
+    // full severity immediately because they do not drive the instability and
+    // ramping them would blunt the inflammatory transient we want to model.
+    const int sev_rungs = (int)env_dbl("WOUND_SEVRAMP", 0);
+    seed_ip(sev_rungs > 0 ? 1.0/sev_rungs : 1.0, true);
     std::cout<<"seeded wound: "<<n_wound_nodes<<" nodes, "<<n_wound_ip
-             <<" integration points  (centre y="<<y_center<<" z="<<z_center_def
+             <<" integration points  (reference centre y="<<y_center<<" z="<<z_center
              <<" deformed, radius "<<r_wound<<" mm)\n";
     if(n_wound_nodes == 0 || n_wound_ip == 0)
         std::cout<<"  *** WARNING: wound region is empty - check the mesh and centre ***\n";
@@ -981,6 +1155,41 @@ int main(int argc, char *argv[])
     const int    n_rung    = (int)env_dbl("WOUND_RUNGS",   40);  // steps per rung
     const double dt_start  = env_dbl("WOUND_DTRAMP", 0.002);
     double t_ramp_total = 0.0;
+
+    // PHASE 2a0: SEVERITY CONTINUATION (WOUND_SEVRAMP rungs, 0 = off).
+    //
+    // Deepen the wound gradually so the stored prestretch energy is released
+    // over many equilibrations instead of one. seed_ip() was already called
+    // with frac = 1/N above, so this loop runs k = 2..N. Each rung re-applies
+    // the profile at a deeper severity and re-equilibrates at the small ladder
+    // step; the mechanics therefore tracks a sequence of nearby equilibria
+    // rather than being asked to jump to a far one.
+    //
+    // Note this ramps phif DOWN monotonically from healthy, recomputing from
+    // the healthy baseline each time rather than from the evolved state. Over
+    // the ~1 h the ramp spans, collagen turnover is negligible (d_phi ~ 0.01/h),
+    // so the discarded evolution is far smaller than the severity increment.
+    const int sev_steps = (int)env_dbl("WOUND_SEVSTEPS", 10);  // solver steps per rung
+    if(sev_rungs > 0 && dt_start > 0.0){
+        std::cout<<"\n#### PHASE 2a0: wound severity continuation, "<<sev_rungs
+                 <<" rungs ####\n";
+        for(int k=2;k<=sev_rungs;k++){
+            const double frac = (double)k/(double)sev_rungs;
+            seed_ip(frac, false);
+            myTissue.time       = 0.0;
+            myTissue.time_step  = dt_start;
+            myTissue.time_final = sev_steps*dt_start;
+            std::ostringstream fs;
+            fs << out_prefix << "_sev" << k << "_";
+            std::cout<<"  severity rung "<<k<<"/"<<sev_rungs<<": frac = "<<frac
+                     <<", "<<sev_steps<<" steps at dt = "<<dt_start<<"\n";
+            sparseWoundSolver(myTissue, fs.str(), std::max(1, sev_steps),
+                              save_node, save_ip);
+            t_ramp_total += sev_steps*dt_start;
+        }
+        reportState(myTissue, IP, "after severity continuation");
+    }
+
     if(dt_start > 0.0 && dt_start < dt_normal && n_rung > 0){
         std::cout<<"\n#### PHASE 2a: puncture transient, geometric dt ladder ####\n";
         int rung = 0;

@@ -10,10 +10,14 @@
 #include <iostream>
 #include <fstream>
 #include <string>
-#include <stdexcept> 
+#include <stdexcept>
 #include <cmath>
+#include <cstdlib>
+#include <algorithm>
+#include <sstream>
 #include "wound.h"
 #include "solver.h"
+#include "local_solver.h"   // resetBranchStats / reportBranchStats
 #include "element_functions.h"
 #include "file_io.h"
 #include <Eigen/Core>
@@ -383,6 +387,9 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             KK2.setZero();
             RR.setZero();
             KK_triplets.clear();
+            // Branch instrumentation: reset before the element loop so the counts
+            // reported below describe exactly this Newton iteration.
+            resetBranchStats();
             SOL.setZero();
             std::vector<double> node_phi(myTissue.n_node,0); node_phi.clear();
             std::vector<int> node_ip_count(myTissue.n_node,0); node_ip_count.clear();
@@ -861,7 +868,61 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 				//std::cout<<"first tangents\nKe_c_x\n"<<Ke_c_x<<"\nKe_c_rho\n"<<Ke_c_rho<<"\nKe_c_c\n"<<Ke_c_c<<"\n";
 			}
 			else{residuum = normRR/(1+residuum0);}
-			
+
+            // RESIDUAL LOCALISATION
+            //
+            // Every claim about WHY Newton stalls has so far been inferred from
+            // aggregate norms. This names the dofs actually carrying the
+            // residual, so "the collapsing wound-rim elements are what kills the
+            // solve" becomes a measurement instead of a correlation: run_w15 has
+            // a one-element ring at 0.23-0.31 mm from the needle axis whose
+            // det(F^e) falls 0.218 -> 0.154 over 16 h. Either the worst dofs sit
+            // on those nodes or they do not.
+            //
+            // Gated on iter so it costs nothing on healthy steps (ordinary steps
+            // converge in 3-4 iterations). Overridable via WOUND_RESLOC.
+            {
+                static const int resloc_iter = [](){
+                    const char* e = std::getenv("WOUND_RESLOC");
+                    return e ? std::atoi(e) : 20;
+                }();
+                // Branch counts on EVERY iteration once we are past resloc_iter.
+                // The limit cycle has period 2, so a single snapshot cannot show
+                // it - the diagnostic value is entirely in whether a count
+                // ALTERNATES from one iteration to the next.
+                if(resloc_iter > 0 && iter >= resloc_iter && iter <= resloc_iter + 8){
+                    std::ostringstream tg; tg << "iter " << iter
+                                              << " R=" << residuum;
+                    reportBranchStats(tg.str().c_str());
+                }
+                if(resloc_iter > 0 && iter == resloc_iter){
+                    std::vector<int> idx(n_dof);
+                    for(int i=0;i<n_dof;i++) idx[i]=i;
+                    const int ntop = std::min(20, n_dof);
+                    std::partial_sort(idx.begin(), idx.begin()+ntop, idx.end(),
+                        [&](int a,int b){ return std::abs(RR(a)) > std::abs(RR(b)); });
+                    static const char* fname[4] = {"x","rho","c","alpha"};
+                    std::cout<<"\n  --- top "<<ntop<<" residual dofs at iter "<<iter
+                             <<" (|RR| total "<<normRR<<") ---\n";
+                    for(int k=0;k<ntop;k++){
+                        const int d = idx[k];
+                        const std::vector<int>& m = myTissue.dof_inv_map[d];
+                        const int nodei = (m[0]==0) ? m[1]/n_coord : m[1];
+                        const Vector3d& X = myTissue.node_x[nodei];
+                        // phif is an integration-point variable, not nodal, so
+                        // print coordinates: the collapsed ring is identifiable
+                        // offline as 0.23-0.31 mm from the needle axis (y=0,
+                        // z=5.49 deformed, x<0).
+                        std::cout<<"    |RR|="<<std::abs(RR(d))
+                                 <<"  field="<<fname[m[0]]
+                                 <<"  node="<<nodei
+                                 <<"  x=("<<X(0)<<","<<X(1)<<","<<X(2)<<")"
+                                 <<"  rwound="<<std::sqrt(X(1)*X(1)+(X(2)-5.49)*(X(2)-5.49))<<"\n";
+                    }
+                    std::cout<<"  ---------------------------------------------\n\n";
+                }
+            }
+
 			// SOLVE: one approach
 			//std::cout<<"solve\n";
 			//KK.setFromTriplets(KK_triplets.begin(), KK_triplets.end());
@@ -1002,13 +1063,48 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 // limits per Newton iteration
                 const double dx_cap    = 0.05;  // [mm]
                 const double dfld_cap  = 0.25;  // normalized concentration
-                double scale = 1.0;
-                if(max_dx     > dx_cap)   scale = std::min(scale, dx_cap/max_dx);
-                if(max_dfield > dfld_cap) scale = std::min(scale, dfld_cap/max_dfield);
-                if(scale < 1.0){
-                    SOL *= scale;
-                    std::cout<<"  damping Newton step by "<<scale
-                             <<" (max dx "<<max_dx<<", max dfield "<<max_dfield<<")\n";
+
+                // WOUND_LINESEARCH=1 scales the mechanics and transport blocks
+                // INDEPENDENTLY instead of taking the min over both and applying
+                // it to the whole vector.
+                //
+                // The coupled form throttles everything to the worst offender in
+                // either block. At the run_w15 failure the log reads
+                //   max dx 0.0130 (cap 0.05 - no damping needed at all)
+                //   max dfield 8.55
+                // so one transport dof forced scale = 0.25/8.55 = 0.029 onto the
+                // MECHANICS increment too. Newton then made ~3% progress per
+                // iteration and burned 57 iterations before the step was rejected.
+                //
+                // Uniform scaling preserves the Newton direction exactly and
+                // per-block scaling does not, which is why the coupled form was
+                // written this way. But a direction held at 3% of its length is
+                // not making progress either, so this is an A/B, not a claim.
+                static const int decouple = [](){
+                    const char* e = std::getenv("WOUND_LINESEARCH");
+                    return e ? std::atoi(e) : 0;
+                }();
+
+                if(decouple){
+                    double sx = 1.0, sf = 1.0;
+                    if(max_dx     > dx_cap)   sx = dx_cap/max_dx;
+                    if(max_dfield > dfld_cap) sf = dfld_cap/max_dfield;
+                    if(sx < 1.0 || sf < 1.0){
+                        for(int dofi=0;dofi<n_dof;dofi++)
+                            SOL(dofi) *= (myTissue.dof_inv_map[dofi][0]==0) ? sx : sf;
+                        std::cout<<"  damping Newton step (decoupled) x by "<<sx
+                                 <<", fields by "<<sf
+                                 <<" (max dx "<<max_dx<<", max dfield "<<max_dfield<<")\n";
+                    }
+                }else{
+                    double scale = 1.0;
+                    if(max_dx     > dx_cap)   scale = std::min(scale, dx_cap/max_dx);
+                    if(max_dfield > dfld_cap) scale = std::min(scale, dfld_cap/max_dfield);
+                    if(scale < 1.0){
+                        SOL *= scale;
+                        std::cout<<"  damping Newton step by "<<scale
+                                 <<" (max dx "<<max_dx<<", max dfield "<<max_dfield<<")\n";
+                    }
                 }
             }
 
@@ -1355,6 +1451,9 @@ void sparseLoadSolver(tissue &myTissue, const std::string& filename, int save_fr
             KK2.setZero();
             RR.setZero();
             KK_triplets.clear();
+            // Branch instrumentation: reset before the element loop so the counts
+            // reported below describe exactly this Newton iteration.
+            resetBranchStats();
             SOL.setZero();
 
             // START LOOP OVER ELEMENTS

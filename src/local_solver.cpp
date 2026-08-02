@@ -67,6 +67,112 @@ static inline double bandDer(double x, double lo, double hi, double w)
     return dsoftplus_w(x - hi, w) + dsoftplus_w(lo - x, w);
 }
 
+//--------------------------------------------------------//
+// GROWTH BOUNDING
+//--------------------------------------------------------//
+//
+// Why this exists. In run_w15, decomposing det(F^e) = J/Jp at the worst node:
+//
+//   t[h]   lamdaE_n   lamdaP_n   lamda_n = lE*lP    Jp
+//    0      0.175      0.959        0.168          0.969
+//   16      0.167      0.650        0.109          0.694    (Jp min over mesh 0.133)
+//
+// The ELASTIC stretch is nearly constant while geometry and growth collapse
+// together: the growth law is chasing a geometric collapse it can never catch.
+// That matters because EVERY stress term in wound.cpp carries Jp as a prefactor
+// (SS_pas, SS_act and SS_vol are all Jp*(...)), so Jp -> 0 removes the element
+// from the stiffness matrix entirely. That is the near-singular tangent the
+// solver has been dying on - not a bifurcation, just elements dissolving.
+//
+// Two things let it run away:
+//   1. bandVal is LINEAR far from the knee, so with lamdaE_n = 0.17 sitting 5x
+//      below the deadband floor of 0.85 the driving term is -0.68 and grows
+//      without limit as lamdaE falls further.
+//   2. lamdaP had NO bound anywhere in the code.
+//
+// satVal caps the driving; growthGate stops lamdaP being pushed past its
+// physical limits. The gate is ONE-SIDED - it only damps motion heading INTO a
+// bound, so lamdaP can always recover back toward the interior.
+//
+// Both are folded into band_a/s/n and their derivatives at the single site where
+// those are computed, so every downstream use (lamdaP_dot and all the dTheta
+// sensitivity rows) stays consistent automatically.
+static inline double growthLo()
+{ static const double v = [](){ const char* e = std::getenv("WOUND_LAMP_LO");
+                                return e ? std::atof(e) : 0.5; }(); return v; }
+static inline double growthHi()
+{ static const double v = [](){ const char* e = std::getenv("WOUND_LAMP_HI");
+                                return e ? std::atof(e) : 2.0; }(); return v; }
+static inline double bandCapMult()
+{ static const double v = [](){ const char* e = std::getenv("WOUND_BANDCAP");
+                                return e ? std::atof(e) : 1.0; }(); return v; }
+
+// Smooth saturation of the driving term: matches x for |x| << cap, bounded by
+// cap. tanh keeps it C-infinity, preserving the C1 residual that the smoothed
+// deadband was introduced to obtain.
+static inline double satVal(double x, double cap)
+{ return (cap > 0.0) ? cap*std::tanh(x/cap) : x; }
+static inline double satDer(double x, double cap)
+{ if(cap <= 0.0) return 1.0; const double t = std::tanh(x/cap); return 1.0 - t*t; }
+
+// One-sided gate on lamdaP. band < 0 shrinks lamdaP, so gate against the lower
+// bound; band > 0 grows it, so gate against the upper.
+static inline double growthGate(double lp, double band, double lo, double hi)
+{
+    const double w = 0.05*(hi - lo);
+    if(band < 0.0) return 0.5*(1.0 + std::tanh((lp - lo)/w));
+    if(band > 0.0) return 0.5*(1.0 + std::tanh((hi - lp)/w));
+    return 1.0;
+}
+
+//--------------------------------------------------------//
+// NON-SMOOTH BRANCH INSTRUMENTATION
+//--------------------------------------------------------//
+//
+// Newton limit-cycles inside a failing step: the residual alternates between two
+// values BIT-FOR-BIT for 200 iterations, e.g. 9.34885e-05 / 9.35687e-05, until
+// max_iter rejects it. That is a slope discontinuity in the residual, not slow
+// convergence and not a singular matrix. Measured cycle amplitude relative to
+// the residual is 8.6e-4 / 4.9e-4 / 4.1e-4 across three runs spanning two orders
+// of magnitude - a PROPORTIONAL signature.
+//
+// There are at least three non-smooth branches in this file that could cause it:
+// the eigenvector sign flip, the eigenvalue-degeneracy nudge, and the deadband.
+// Rather than guess, count how many integration points sit in each branch and
+// how close they are to flipping. A branch whose COUNT alternates between Newton
+// iterations, or whose margin is ~0, is the culprit.
+//
+// Counters are accumulated on the FINAL local substep only (the state Newton
+// actually sees) and merged under one critical per IP, which is the same
+// granularity the element loop already pays.
+namespace {
+struct BranchStats {
+    long n_ip = 0, n_signflip = 0, n_degen = 0;
+    long n_band_a = 0, n_band_s = 0, n_band_n = 0;
+    double min_dot     = 1e30;   // min |a0.vectormax|  -> 0 means sign flip is imminent
+    double min_eiggap  = 1e30;   // min pairwise |lamda_i - lamda_j| (degeneracy margin)
+    double min_bandgap = 1e30;   // min distance of any lamdaE to a deadband edge
+    double worst_x = 0, worst_y = 0, worst_z = 0;  // position of the min-margin IP
+};
+BranchStats g_bs;
+}
+
+void resetBranchStats() { g_bs = BranchStats(); }
+
+void reportBranchStats(const char *tag)
+{
+    std::cout << "  [branch " << tag << "] ips=" << g_bs.n_ip
+              << "  signflip=" << g_bs.n_signflip
+              << "  degen=" << g_bs.n_degen
+              << "  outband a/s/n=" << g_bs.n_band_a << "/" << g_bs.n_band_s
+              << "/" << g_bs.n_band_n
+              << "  | margins dot=" << g_bs.min_dot
+              << " eiggap=" << g_bs.min_eiggap
+              << " bandgap=" << g_bs.min_bandgap
+              << "  worst@(" << g_bs.worst_x << "," << g_bs.worst_y << ","
+              << g_bs.worst_z << ")\n";
+}
+
 
 //========================================================//
 // EXPLICIT LOCAL PROBLEM: structural update
@@ -257,14 +363,50 @@ void localWoundProblemExplicit(
         Vector3d vectormax = vectors.col(2);
         Vector3d vectormed = vectors.col(1);
         Vector3d vectormin = vectors.col(0);
-        if (a0.dot(vectormax) < 0) {
+        // INSTRUMENTATION: capture the branch margins before either branch acts.
+        const double bs_dot = a0.dot(vectormax);          // -> 0 means the sign flip is imminent
+        const double bs_eiggap = std::min(std::min(std::abs(lamdamin-lamdamed),
+                                                   std::abs(lamdamin-lamdamax)),
+                                          std::abs(lamdamed-lamdamax));
+        bool bs_signflip = false, bs_degen = false;
+
+        // EIGENVECTOR SIGN CONVENTION - the source of the Newton limit cycle.
+        //
+        // SelfAdjointEigenSolver returns eigenvectors with an arbitrary sign, so
+        // this picks the end of the principal axis nearer a0. Measured: 38465 of
+        // 79844 IPs (48%) take the flip, and the closest sits at
+        // |a0.vectormax| = 0.00137. Four IPs straddle zero and flip EVERY Newton
+        // iteration, which reverses an O(1) contribution to a0_dot and produces
+        // the period-2 residual cycle (signflip alternating 38465/38461 in exact
+        // lockstep with residual 8.98273e-05/8.98608e-05).
+        //
+        // The ambiguity is real, not numerical: at a0 perpendicular to the
+        // principal axis both ends are equidistant, and that is precisely where
+        // |(I-a0a0)*vectormax| is LARGEST - so the hard flip puts its worst
+        // discontinuity exactly where the driving term is strongest.
+        //
+        // WOUND_SIGNEPS replaces sign() with tanh(dot/eps): identical away from
+        // the ambiguous point, and smoothly vanishing at it, which is also the
+        // physically right answer (no preferred end => no preferred rotation).
+        // Set to 0 for the legacy hard flip.
+        static const double sign_eps = [](){
+            const char* e = std::getenv("WOUND_SIGNEPS");
+            return e ? std::atof(e) : 0.05;
+        }();
+        if(sign_eps > 0.0){
+            const double s = std::tanh(bs_dot/sign_eps);
+            if(bs_dot < 0.0) bs_signflip = true;
+            vectormax = s*vectormax;
+        }else if (a0.dot(vectormax) < 0) {
             vectormax = -vectormax;
+            bs_signflip = true;
         }
         // If CC is the identity matrix, the eigenvectors are arbitrary which is problematic.
         // Beware the matrix becoming singular. Need to perturb.
         double epsilon = 1e-7;
         double delta = 1e-7;
         if(abs(lamdamin-lamdamed) < epsilon || abs(lamdamin-lamdamax) < epsilon || abs(lamdamed-lamdamax) < epsilon){
+            bs_degen = true;
             lamdamax = lamdamax*(1+delta);
             lamdamin = lamdamin*(1-delta);
             lamdamed = lamdamed/((1+delta)*(1-delta));
@@ -337,12 +479,28 @@ void localWoundProblemExplicit(
         // values that replace the old (lamdaE - lim) branches; band_*_der are
         // their derivatives, needed by the tangent below. Computed once here so
         // the residual and every chain-rule site use the same numbers.
-        const double band_a = bandVal(lamdaE_a, lowlim, uplim, band_w);
-        const double band_s = bandVal(lamdaE_s, lowlim, uplim, band_w);
-        const double band_n = bandVal(lamdaE_n, lowlim, uplim, band_w);
-        const double band_a_der = bandDer(lamdaE_a, lowlim, uplim, band_w);
-        const double band_s_der = bandDer(lamdaE_s, lowlim, uplim, band_w);
-        const double band_n_der = bandDer(lamdaE_n, lowlim, uplim, band_w);
+        // Raw deadband, then saturated (bounds the RATE) and gated (bounds the
+        // STATE). See the growth-bounding block at the top of this file: both
+        // are needed - saturation alone still lets lamdaP drift to zero given
+        // time, and gating alone leaves an arbitrarily stiff driving term.
+        const double band_a_raw = bandVal(lamdaE_a, lowlim, uplim, band_w);
+        const double band_s_raw = bandVal(lamdaE_s, lowlim, uplim, band_w);
+        const double band_n_raw = bandVal(lamdaE_n, lowlim, uplim, band_w);
+        const double bcap  = bandCapMult()*(uplim - lowlim);
+        const double g_lo  = growthLo(), g_hi = growthHi();
+        const double gate_a = growthGate(lamdaP(0), band_a_raw, g_lo, g_hi);
+        const double gate_s = growthGate(lamdaP(1), band_s_raw, g_lo, g_hi);
+        const double gate_n = growthGate(lamdaP(2), band_n_raw, g_lo, g_hi);
+
+        const double band_a = gate_a*satVal(band_a_raw, bcap);
+        const double band_s = gate_s*satVal(band_s_raw, bcap);
+        const double band_n = gate_n*satVal(band_n_raw, bcap);
+        // Chain rule: d(gate*sat(raw))/dlamdaE = gate*sat'(raw)*d(raw)/dlamdaE.
+        // The dgate/dlamdaP term is dropped, consistent with lamdaP being held
+        // explicit within a substep.
+        const double band_a_der = gate_a*satDer(band_a_raw, bcap)*bandDer(lamdaE_a, lowlim, uplim, band_w);
+        const double band_s_der = gate_s*satDer(band_s_raw, bcap)*bandDer(lamdaE_s, lowlim, uplim, band_w);
+        const double band_n_der = gate_n*satDer(band_n_raw, bcap)*bandDer(lamdaE_n, lowlim, uplim, band_w);
 
         lamdaP_dot(0) = phif_dot_plus*band_a/tau_lamdaP_a;
         lamdaP_dot(1) = phif_dot_plus*band_s/tau_lamdaP_s;
@@ -812,6 +970,30 @@ void localWoundProblemExplicit(
 
         // Permanent deformation LAMDAP
         lamdaP = lamdaP + local_dt*(lamdaP_dot);
+
+        // INSTRUMENTATION: merge this IP's branch state on the FINAL substep -
+        // that is the state the global Newton iteration actually sees.
+        if(step == (int)time_step_ratio - 1){
+            auto edge = [&](double le){ return std::min(std::abs(le-lowlim),
+                                                        std::abs(le-uplim)); };
+            const double bs_bandgap = std::min(std::min(edge(lamdaE_a), edge(lamdaE_s)),
+                                               edge(lamdaE_n));
+#pragma omp critical
+            {
+                g_bs.n_ip++;
+                if(bs_signflip) g_bs.n_signflip++;
+                if(bs_degen)    g_bs.n_degen++;
+                if(band_a_raw != 0.0) g_bs.n_band_a++;
+                if(band_s_raw != 0.0) g_bs.n_band_s++;
+                if(band_n_raw != 0.0) g_bs.n_band_n++;
+                if(std::abs(bs_dot) < g_bs.min_dot) g_bs.min_dot = std::abs(bs_dot);
+                if(bs_eiggap < g_bs.min_eiggap)     g_bs.min_eiggap = bs_eiggap;
+                if(bs_bandgap < g_bs.min_bandgap){
+                    g_bs.min_bandgap = bs_bandgap;
+                    g_bs.worst_x = X(0); g_bs.worst_y = X(1); g_bs.worst_z = X(2);
+                }
+            }
+        }
 
         //std::cout << "\nphif: " << phif << ", kappa: " << kappa << ", lamdaP:" << lamdaP(0) << "," << lamdaP(1) << "," << lamdaP(2)
         //          << ",a0:" << a0(0) << "," << a0(1) << "," << a0(2) << ",s0:" << s0(0) << "," << s0(1) << "," << s0(2) << ",n0:" << n0(0) << "," << n0(1) << "," << n0(2) << "\n";

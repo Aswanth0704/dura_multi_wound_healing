@@ -19,8 +19,82 @@ This code is the implementation of the DaLaWoHe
 #include <Eigen/OrderingMethods>
 #include <Eigen/Eigenvalues>
 #include <fstream>
+#include <cstdlib>
 
 using namespace Eigen;
+
+//--------------------------------------------------------//
+// VOLUMETRIC PENALTY SCALING  (WOUND_VOLPHI, default 1 = legacy)
+//--------------------------------------------------------//
+//
+// The volumetric energy is
+//
+//     Psi_vol(Je) = (phi*p/2)(Je-1)^2 - 2*phi*k0*ln(Je)
+//
+// The log term is the ONLY barrier preventing element inversion, and in the
+// legacy form it carries phif. Balancing it against a confining pressure P
+// gives Je ~ 2*phi*k0/P, i.e. the equilibrium elastic volume is PROPORTIONAL
+// to collagen fraction - the barrier is weakest exactly where it is needed
+// most. Measured in run_w15: a one-element ring on the wound rim collapses from
+// det(F^e) = 0.218 to 0.154 over 16 h, count below 0.25 doubling every 4 h,
+// while the far field holds 0.99739 exactly. corr(phif, det F^e) = 0.86.
+//
+// Physically the legacy scaling is backwards. Soft tissue is near-incompressible
+// because it is ~75% WATER, not because of collagen; a wound fills with blood,
+// fibrin and granulation tissue, all ~90% water, so the BULK modulus barely
+// changes while shear and fiber stiffness genuinely do collapse. Only the pure
+// penalty term is mis-scaled.
+//
+// At WOUND_VOLPHI=0 the penalty becomes collagen-independent. The -2*phi*k0/Je
+// term KEEPS its phif: it is paired with the phif*k0*Identity in SSe_pas and the
+// two cancel at Ce = I (where E = 0 so Psif1 = Psif4 = 0), which is what makes
+// the reference state stress-free for every phi. Unscaling k0 there without
+// unscaling it here would leave (phi-1)*k0*I ~ -0.019 MPa of spurious pressure
+// in the wound. Exact no-op at phif = 1, so homeostasis is untouched.
+static inline double volPenaltyScale(double phif)
+{
+    static const int legacy = [](){
+        const char* e = std::getenv("WOUND_VOLPHI");
+        return e ? std::atoi(e) : 1;
+    }();
+    return legacy ? phif : 1.0;
+}
+
+//--------------------------------------------------------//
+// MECHANICAL COLLAGEN FLOOR  (WOUND_PHIFLOOR, default 0 = off)
+//--------------------------------------------------------//
+//
+// Removes the DRIVER of the growth runaway rather than its amplifier.
+//
+// With phif -> 0.01 the wound retains ~0.2 Pa of shear stiffness, so the soft
+// inclusion is stretched in-plane by the prestretched surround (theta_e -> 2.05)
+// and thinned to lamda_n = 0.168 - three times past what incompressibility
+// permits (1/2.05 = 0.49). That puts lamdaE_n ~ 0.17, five times below the
+// growth deadband floor of 0.85, which is what drives lamdaP (and hence Jp, and
+// hence the element's entire stress response) toward zero.
+//
+// Flooring the collagen fraction seen by the PASSIVE stress keeps a physically
+// real residual stiffness: at phif_floor = 0.05 the wound holds ~1 kPa in shear,
+// the right order for granulation tissue, which is fibrin and cells rather than
+// a void.
+//
+// Applies to the GROUND-SUBSTANCE (k0) terms only, and to BOTH of them: the
+// phif*k0*Identity in SSe_pas and the -2*phif*k0/Je in the volumetric part are
+// one neo-Hookean material and must be floored together, or the element carries
+// (phif_floor - phif)*k0*I of spurious pressure at zero strain. Floored together
+// they still cancel exactly at Ce = I, where E = 0 so the fibre terms vanish.
+//
+// The FIBRE terms (Psif1, Psif4) keep the true unfloored phif - no collagen
+// means no fibre load, which is correct and is what lets the wound stay soft in
+// shear and still contract.
+static inline double phifMech(double phif)
+{
+    static const double floor_v = [](){
+        const char* e = std::getenv("WOUND_PHIFLOOR");
+        return e ? std::atof(e) : 0.0;
+    }();
+    return (phif > floor_v) ? phif : floor_v;
+}
 
 //--------------------------------------------------------//
 // RESIDUAL AND TANGENT
@@ -150,8 +224,13 @@ void evalWound(
         IP = LineQuadriIPTetQuadratic();
     }
     int IP_size = IP.size();
-    // we are going to interpolate the position
-    Vector3d X; X.setZero();
+    // Interpolated reference position of the current integration point.
+    // NOTE: this used to be declared (and zeroed) OUTSIDE the loop while being
+    // accumulated inside it, so it summed the positions of every IP visited so
+    // far - by the 4th tet IP it read ~4x a real coordinate. Nothing consumed it
+    // (localWoundProblemExplicit takes X but never uses it), so there was no
+    // physical effect, but it made any per-IP position reporting nonsense.
+    Vector3d X;
     //std::cout<<"loop over integration points\n";
     for(int ip=0;ip<IP_size;ip++)
     {
@@ -216,6 +295,7 @@ void evalWound(
         double c=0.; Vector3d dcdXi; dcdXi.setZero();
         double alpha_0=0.; Vector3d dalpha0dXi; dalpha0dXi.setZero();
         double alpha=0.;   Vector3d dalphadXi;  dalphadXi.setZero();
+        X.setZero();   // per-IP, not accumulated across the element
         //
         for(int ni=0;ni<elem_size;ni++)
         {
@@ -537,7 +617,10 @@ void evalWound(
         double Psif1 = 2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
         double Psif4 = 2*k2*(1-3*kappa)*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
         //Matrix3d SSe_pas = k0*Identity + phif*(Psif1*Identity + Psif4*a0a0);
-        Matrix3d SSe_pas = phif*(k0*Identity + Psif1*Identity + Psif4*a0a0);
+        // Ground substance uses the FLOORED collagen fraction (phifMech, a no-op
+        // unless WOUND_PHIFLOOR is set); fibres keep the true phif.
+        Matrix3d SSe_pas = phifMech(phif)*k0*Identity
+                         + phif*(Psif1*Identity + Psif4*a0a0);
         // pull back to the reference,
         Matrix3d SS_pas = Jp*FFginv*SSe_pas*FFginv;
 
@@ -557,8 +640,8 @@ void evalWound(
         // SSvol = 2dPsivol/dCC = 2dPsivol/dJe * dJe/dCC
         double penalty = 0.3166667;
         double Psivol = 0.5*phif*pow(penalty*(Je-1.),2) - 2*phif*k0*log(Je); //*phif
-        double dPsivoldJe = phif*penalty*(Je-1.) - 2*phif*k0/Je;
-        double dPsivoldJedJe = phif*penalty + 2*phif*k0/(Je*Je);
+        double dPsivoldJe = volPenaltyScale(phif)*penalty*(Je-1.) - 2*phifMech(phif)*k0/Je;
+        double dPsivoldJedJe = volPenaltyScale(phif)*penalty + 2*phifMech(phif)*k0/(Je*Je);
     double D_rhorho = evalDrho(phif, c);
         Matrix3d SSe_vol = dPsivoldJe*Je*CCeinv/2; // = phif*penalty*Je*(Je-1.)*CCeinv/2 - phif*k0*CCeinv;
         Matrix3d SS_vol = Jp*FFginv*SSe_vol*FFginv;
@@ -1397,7 +1480,8 @@ void evalFluxesSources(const std::vector<double> &global_parameters, const doubl
     double Psif1 = 2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
     double Psif4 = 2*k2*(1-3*kappa)*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
     //Matrix3d SSe_pas = k0*Identity + phif*(Psif1*Identity + Psif4*a0a0);
-    Matrix3d SSe_pas = phif*(k0*Matrix3d::Identity() + Psif1*Matrix3d::Identity() + Psif4*a0a0);
+    Matrix3d SSe_pas = phifMech(phif)*k0*Matrix3d::Identity()
+                     + phif*(Psif1*Matrix3d::Identity() + Psif4*a0a0);
     // pull back to the reference,
     Matrix3d SS_pas = Jp*FFginv*SSe_pas*FFginv;
     //------------------//
@@ -1412,7 +1496,7 @@ void evalFluxesSources(const std::vector<double> &global_parameters, const doubl
     // Instead of (double pressure = -k0*lamda_N*lamda_N;) directly, add volumetric part of stress SSvol
     double penalty = 0.3166667;
     double Psivol = 0.5*phif*pow(penalty*(Je-1.),2) - 2*phif*k0*log(Je);
-    double dPsivoldJe = phif*penalty*(Je-1.) - 2*phif*k0/Je;
+    double dPsivoldJe = volPenaltyScale(phif)*penalty*(Je-1.) - 2*phifMech(phif)*k0/Je;
     Matrix3d SSe_vol = dPsivoldJe*Je*CCeinv/2;
     Matrix3d SS_vol = Jp*FFginv*SSe_vol*FFginv;
     //------------------//
@@ -1665,8 +1749,11 @@ void evalSS(const std::vector<double> &global_parameters, double phif, Vector3d 
     // Instead of (double pressure = -k0*lamda_N*lamda_N;) directly, add volumetric part of stress SSvol
     double penalty = 0.3166667;
     double Psivol = 0.5*phif*pow(penalty*(Je-1.),2) - 2*phif*k0*log(Je);
-    double dPsivoldJe = phif*penalty*(Je-1.) - 2*phif*k0/Je;
-    double dPsivoldJedJe = phif*penalty + 2*k0/(Je*Je);
+    // NOTE: evalSS is dead (only referenced from commented-out FD blocks). Kept
+    // consistent with evalWound anyway. The k0 term here was missing its phif,
+    // unlike every other site - fixed, so reviving this does not reintroduce it.
+    double dPsivoldJe = volPenaltyScale(phif)*penalty*(Je-1.) - 2*phifMech(phif)*k0/Je;
+    double dPsivoldJedJe = volPenaltyScale(phif)*penalty + 2*phifMech(phif)*k0/(Je*Je);
     Matrix3d SSe_vol = dPsivoldJe*Je*CCeinv/2;
     SS_vol = Jp*FFginv*SSe_vol*FFginv;
 }
@@ -2679,7 +2766,10 @@ void evalWoundMechanics(double dt, double time, double time_final,
         double Psif1 = 2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
         double Psif4 = 2*k2*(1-3*kappa)*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
         //Matrix3d SSe_pas = k0*Identity + phif*(Psif1*Identity + Psif4*a0a0);
-        Matrix3d SSe_pas = phif*(k0*Identity + Psif1*Identity + Psif4*a0a0);
+        // Ground substance uses the FLOORED collagen fraction (phifMech, a no-op
+        // unless WOUND_PHIFLOOR is set); fibres keep the true phif.
+        Matrix3d SSe_pas = phifMech(phif)*k0*Identity
+                         + phif*(Psif1*Identity + Psif4*a0a0);
         // pull back to the reference,
         Matrix3d SS_pas = Jp*FFginv*SSe_pas*FFginv;
 
@@ -2699,8 +2789,8 @@ void evalWoundMechanics(double dt, double time, double time_final,
         // SSvol = 2dPsivol/dCC = 2dPsivol/dJe * dJe/dCC
         double penalty = 0.3166667;
         double Psivol = 0.5*phif*pow(penalty*(Je-1.),2) - 2*phif*k0*log(Je); //*phif
-        double dPsivoldJe = phif*penalty*(Je-1.) - 2*phif*k0/Je;
-        double dPsivoldJedJe = phif*penalty + 2*phif*k0/(Je*Je);
+        double dPsivoldJe = volPenaltyScale(phif)*penalty*(Je-1.) - 2*phifMech(phif)*k0/Je;
+        double dPsivoldJedJe = volPenaltyScale(phif)*penalty + 2*phifMech(phif)*k0/(Je*Je);
         Matrix3d SSe_vol = dPsivoldJe*Je*CCeinv/2; // = phif*penalty*Je*(Je-1.)*CCeinv/2 - phif*k0*CCeinv;
         Matrix3d SS_vol = Jp*FFginv*SSe_vol*FFginv;
 
