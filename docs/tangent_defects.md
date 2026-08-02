@@ -445,6 +445,27 @@ typo, and removing it would mean differentiating the discrete update exactly.
 A tangent error of this size costs Newton *iterations*, not correctness: the
 residual is untouched, so any converged answer remains the right answer.
 
+### Postscript (1 August 2026): this was not what stopped the simulation
+
+The work in this document was necessary and the four defects it fixes are real,
+but the residual 3.45e-04 in `Ke_x_x` was **not** the reason runs stalled at
+16.8-21.6 hours. That cause is documented separately in
+[`convergence_failure.md`](convergence_failure.md): a **discontinuous eigenvector
+sign convention** in the fibre-reorientation law made the residual continuous but
+not continuously differentiable, so Newton entered a period-two limit cycle -
+alternating between two residual values bit-for-bit for 200 iterations rather than
+converging.
+
+The distinction matters for reading this document. An *inexact* tangent slows
+convergence; a *non-differentiable residual* prevents it entirely, and no amount of
+tangent accuracy repairs it. That is why the campaign here moved the stall point
+only from 14.2 to 16.5 hours despite taking 15 of 16 blocks to 8-13 digits.
+
+Replacing `sign(a0.v_max)` with `tanh(a0.v_max / 0.05)` produced a **55-fold**
+increase in progress in a controlled comparison against the same executable with
+the hard switch restored. See `convergence_failure.md` sections 4-6 for the
+derivation and the measurements.
+
 ---
 
 ## 11. Reproducing

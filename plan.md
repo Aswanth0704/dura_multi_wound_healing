@@ -38,7 +38,7 @@ s_c
 p_{c,\alpha}\alpha
 +
 \left(
-p_{c,\rho}c+p_{c,e}H(J^e)
+p_{c,\rho}c+p_{c,e}H(\theta^e)
 \right)
 \left(
 \frac{\rho}{K_{c,c}+c}
@@ -51,9 +51,15 @@ $$
 
 $$
 \dot{\rho}
-=
-\nabla\cdot Q_\rho+s_\rho
++
+\nabla\cdot Q_\rho = s_\rho
 $$
+
+> **Sign corrected (2026-08-02).** This was previously written
+> $\dot\rho = \nabla\cdot Q_\rho + s_\rho$ with $Q_\rho=-D_\rho\nabla\rho$, which is
+> *anti*-diffusion — it would amplify gradients rather than smooth them. The code has
+> always implemented the form above, consistent with the $c$ and $\alpha$ equations.
+> The equation, not the code, was wrong.
 
 $$
 Q_\rho=-D_\rho(\phi,c)\nabla\rho
@@ -72,7 +78,7 @@ p_\phi
 +
 p_{\phi,c}\frac{c}{K_{\phi,c}+c}
 +
-p_{\phi,e}H(J^e)
+p_{\phi,e}H(\theta^e)
 \right)
 \left(
 \frac{\rho}{K_{\phi,\rho}+\phi}
@@ -84,6 +90,18 @@ d_\phi+c\rho d_{\phi,c}
 $$
 
 Equations of Mechanics and micro-structures like plastic growth, collagen remodeling terms like dispersion and orientation are mostly unchanged and hence no need for any modifications to the code.
+
+> **Mechanosensing argument corrected (2026-08-02).** The source terms above were
+> written $H(J^e)$; they are now $H(\theta^e)$, matching both the parameter table
+> below and the implementation. The distinction is not cosmetic: the tissue is
+> modelled as incompressible, so $\det \mathbf{F}^e = 1$ identically and $H(J^e)$
+> could never respond to membrane stretch at all. The stimulus is the **in-plane
+> areal stretch of the dural mid-surface**,
+> $$\theta^e = \left\| \mathrm{cof}(\mathbf{F}^e)\cdot \mathbf{n}_0 \right\|
+>            = \frac{J\sqrt{\mathbf{n}_0^{\mathsf T}\mathbf{C}^{-1}\mathbf{n}_0}}
+>                   {\lambda^P_a \lambda^P_s},$$
+> with $\mathbf{n}_0$ the through-thickness normal. $J^e$ is still used for the
+> volumetric part of the stress, which is a different quantity.
 
 Implementation details:
 0. Actually we have to push the code files to gihub. Then when editing the code, we can work on a new branch and do the editing there so that these files are saved. Github is already linked to this laptop. So, we just need to create a new repository and keep updating them. No need to push unnecessary files or results. just @src/, @include/, @scripts/, @meshing/ to the github.
@@ -303,3 +321,20 @@ For healthy tissue:
 rho = 1.0, c = 1.0, phi = 1.0, alpha = 1e-4 (actually should be zero, but I am not sure if the solver with throw erros)
 for wound (intially):
 rho = 1e-4, c = 1e-4, phi = 1e-2, alpha = 1.0 (I want to avoid using 0 for numerical stability)
+
+> **As implemented (2026-08-02):** homeostasis is $(\alpha,\rho,c,\phi) = (0,1,1,1)$
+> exactly — $\alpha_h = 0$, **not** $10^{-4}$. The solver does not throw. Setting
+> $\alpha_h = 10^{-4}$ was rejected deliberately: it would inject
+> $p_{c,\alpha}\alpha_h = 2.1\times10^{-5}$ against $d_c c_h = 3.9\times10^{-3}$, a
+> permanent $0.54\%$ bias in the cytokine balance, and would destroy the exact fixed
+> point that the derived parameters are constructed to give. The cost is that
+> $\alpha$ has no headroom below zero and shows a transient undershoot of about
+> $1.7\%$ at the wound front, which damps. A standing bias is worse than a decaying
+> artifact.
+>
+> The wound initial condition is **not** attained exactly either, because the seed is
+> a smooth $\tanh$ profile rather than a step (a step produced Galerkin oscillations
+> and Newton increments of order $124$). Peak severity on the needle axis is $0.9651$,
+> so the axis reads $\rho, c \approx 0.035$ and $\phi \approx 0.045$ rather than the
+> nominal $10^{-4}$ and $10^{-2}$. See `ToDo.md` for the one-line normalisation that
+> recovers the nominal values, and its side effects.

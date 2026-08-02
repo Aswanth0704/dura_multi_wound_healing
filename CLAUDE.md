@@ -26,7 +26,7 @@ C++17 with Eigen (dense + sparse), Boost (header-only string algorithms, used by
 mkdir build && cd build
 cmake ..            # probes for Eigen and Boost; -DUSE_MKL=OFF to skip MKL
 make -j12
-make tests && ctest # 3 suites, all should pass
+make tests && ctest # 4 suites, all should pass
 ```
 
 `cmake` locates Eigen and Boost by probing, so no paths need editing. Two things to know:
@@ -60,6 +60,34 @@ The binary reads **bare relative** mesh paths and writes all output to the cwd, 
 | `WOUND_PATCH` | free-patch radius as a multiple of `r_wound` |
 | `WOUND_NOWOUND` | stop after the homeostasis gate |
 | `WOUND_VERBOSE` | full node/element/jacobian/dof dumps (gigabytes on a fine mesh) |
+
+Model and wound-seeding knobs:
+
+| Variable | Effect | Default |
+|---|---|---|
+| `WOUND_TRHO` | active traction `t_rho` — the sweep used ×1 … ×1000; `t_rho_c` follows at a fixed 3.28571 ratio | 1.28571e-3 MPa |
+| `WOUND_WSMOOTH` | width of the `tanh` wound seed profile | `1.7 * mean_edge_local` (mesh-dependent) |
+| `WOUND_KCUT` | steepness of the low-collagen gate `C_low` | 300 |
+| `WOUND_ALPHA_D` / `WOUND_ALPHA_DECAY` / `WOUND_ALPHA_PC` | `D_alpha`, `d_alpha`, `p_c_alpha` | per `plan.md` |
+| `WOUND_NOPRESTRETCH` | skip phase 1 entirely | off |
+| `WOUND_FREEZEX` | fix every displacement dof (transport-only experiment) | off |
+| `WOUND_SEVRAMP` / `WOUND_SEVSTEPS` | continuation: seed the wound in severity increments | off |
+
+Solver and smoothness knobs (all default to the production behaviour):
+
+| Variable | Effect | Default |
+|---|---|---|
+| `WOUND_SIGNEPS` | width of the smooth eigenvector sign; **0 restores the old hard flip and reproduces the limit cycle** | 0.05 |
+| `WOUND_LAMP_LO` / `WOUND_LAMP_HI` | plastic-growth bounds | 0.5 / 2.0 |
+| `WOUND_BANDCAP` | saturation cap on the deadband term | 1.0 |
+| `WOUND_BANDW` | smoothing width of the deadband threshold; **0 restores the original hard threshold** | 0.002 |
+| `WOUND_TAULAMP` | scales `tau_lamdaP_*` | 1 |
+| `WOUND_LOCALSUB` | local forward-Euler substeps (`time_step_ratio`) | 25 |
+| `WOUND_TOL` / `WOUND_TOL_INC` / `WOUND_MAXITER` | Newton tolerances and iteration cap | — |
+| `WOUND_DTRAMP` / `WOUND_RUNGS` | the dt ladder that absorbs the puncture transient | — |
+| `WOUND_LINESEARCH` | decoupled damping branch | off |
+| `WOUND_RESLOC` | iteration at which to print the 20 largest-residual dofs | 20 |
+| `WOUND_FDEPS` | finite-difference step for the tangent check | — |
 
 Use `files/dura_cyl_repeated_wound_v62_2t_finer.mphtxt` (≈5k nodes) for verification and `..._20t_finer` for production.
 
@@ -147,6 +175,10 @@ The linear solve does three things that are load-bearing:
 Plus a NaN/Inf guard on the assembled system that names the offending dof and field, and a per-step negative-species report. On divergence the step is rejected and `time_step` halved; the rollback restores `node_x` from a per-step snapshot as well as the `_0` fields. There is deliberately **no clamping** of concentrations — clamping would hide a convergence failure rather than fix one.
 
 **Tet quadrature is 4-point (Keast), not 1-point.** One centroid point makes all four linear shape functions equal 1/4, so the element mass/reaction matrix is rank 1, leaving three near-null modes per element. Uniform fields never excite them — which is why settling always looked fine — but a wound gradient does: Newton asked for concentration increments of ~124 while the residual stayed small. The 4-point rule is degree 2, exact for the linear-tet mass matrix.
+
+**`LineQuadriIPTetQuadratic` is still broken — do not use tet10.** It returns the same rule as the linear case, which cannot integrate quadratic shape functions, leaving six spurious modes per element. The quadratic tet needs a degree-4 rule (11- or 15-point Keast). The element will run and produce quietly wrong answers, exactly as the 1-point linear rule did.
+
+**Eigenvector sign convention must stay smooth.** Fiber reorientation uses `v_max` from `C^e v = lambda v`, which is defined only up to sign. A hard `sign(a0.dot(v_max))` flip makes the residual discontinuous — the jump is `2k(I - a0 (x) a0) v_max`, of magnitude `2k|sin(theta)|`, which is *largest exactly at the flip* (theta = pi/2). That put Newton in a period-2 limit cycle and stalled every healing run. It is now `tanh(s/eps)` with `eps = WOUND_SIGNEPS` (default 0.05). Setting `WOUND_SIGNEPS=0` restores the old hard flip — useful only for reproducing the failure. Full derivation in `docs/convergence_failure.md`.
 
 ### Output
 

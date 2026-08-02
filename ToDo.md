@@ -1,10 +1,25 @@
 # ToDo — normalize parameters, fix mechanosensing, add pro-inflammatory species α
 
-**Status: all 14 steps implemented.** Branch `normalize-and-alpha`, pushed to
+**Status: all 14 steps implemented, and the solver now completes four-week healing
+runs.** Branch `normalize-and-alpha`, pushed to
 `github.com/Aswanth0704/dura_multi_wound_healing` (private).
 
-Companion to `plan.md` (model equations and calibrated parameter table) and
-`CLAUDE.md` (architecture guidance).
+Two four-week (672 h) simulations have run to completion on the cylindrical geometry
+with **zero rejected time steps** and 14 of 15 verification checks passing:
+
+| Run | active traction | simulated time | rejected steps | wall clock |
+|---|---|---|---|---|
+| `run_h01_trho1` | calibrated ($t_\rho \times 1$) | 669.6 h | 0 | 15:34 |
+| `run_h02_trho10` | $t_\rho \times 10$ | 669.6 h | 0 | 19:20 |
+
+The single failing check in both is a concentration undershoot of $-1.7\times10^{-3}$
+at the first time step after puncture — the known transient described under "Open
+items", not a drift.
+
+Companion to `plan.md` (model equations and calibrated parameter table),
+`CLAUDE.md` (architecture guidance), `docs/convergence_failure.md` (the full
+mathematical account of the convergence failure and its cure) and
+`docs/tangent_defects.md`.
 
 ---
 
@@ -24,7 +39,13 @@ Companion to `plan.md` (model equations and calibrated parameter table) and
 | 9–14 | α as a 4th monolithic field, 4×4 block system, VTK output | dof count grows by exactly one per unconstrained node; gate still holds with α in the system |
 | — | Homeostasis derivation extracted to a shared header | `tests/test_homeostasis.cpp`: exact fixed point under 28 parameter perturbations |
 
-`ctest` → **3/3 suites passing** on both macOS and Negishi.
+`ctest` → **4/4 suites passing** on Negishi (`mechanosensing`, `diffusivity`,
+`homeostasis`, `tangent`). The `tangent` suite was added later; it finite-differences
+the element tangent against the residual.
+
+⚠️ The macOS build needs OpenMP, which Apple's clang does not ship. Install it with
+`brew install libomp` if a local build is wanted; otherwise build on Negishi, which is
+the reference environment.
 
 ### Decisions taken along the way
 Normalized units · derived parameters from closed forms · prestretch via a preload
@@ -97,6 +118,125 @@ Negishi is a *partial* copy — it has `boost/algorithm/string.hpp` but is missi
 the Eigen include directory is the project *parent*, `-I ..` put the broken tree
 ahead of the real one; the first build only succeeded because the module had also
 set `CPATH`. The probe now requires a deep header and is added with `BEFORE`.
+
+---
+
+## The convergence failure and its cure
+
+Full account with derivations in `docs/convergence_failure.md`. Summary:
+
+**Symptom.** After the seven fixes above, healing runs still stalled. Newton would
+enter a **period-two limit cycle** — the residual alternating between two values
+without decreasing — so the step was rejected, the time step halved, and the run
+crawled to a stop well short of four weeks.
+
+**Cause.** A genuine discontinuity in the residual, not a bad tangent. The fibre
+reorientation law evolves the mean fibre direction toward the principal direction of
+maximum stretch,
+
+$$\dot{\mathbf{a}}_0 = k\left(\mathbf{I}-\mathbf{a}_0\otimes\mathbf{a}_0\right)\mathbf{v}_{\max},$$
+
+and because an eigenvector of $\mathbf{C}^e\mathbf{v}=\lambda\mathbf{v}$ is defined
+only up to sign, the code picked a branch with a hard flip,
+
+$$\mathbf{v}_{\max} \leftarrow \operatorname{sign}\!\left(\mathbf{a}_0\cdot\mathbf{v}_{\max}\right)\mathbf{v}_{\max}.$$
+
+Let $s=\mathbf{a}_0\cdot\mathbf{v}_{\max}$. Crossing $s=0$ makes the right-hand side
+jump by
+
+$$\Delta\dot{\mathbf{a}}_0 = 2k\left(\mathbf{I}-\mathbf{a}_0\otimes\mathbf{a}_0\right)\mathbf{v}_{\max},
+\qquad \left\|\Delta\dot{\mathbf{a}}_0\right\| = 2k\left|\sin\theta\right|,$$
+
+which is **largest exactly where the flip happens**, at $\theta = \pi/2$. The residual
+is therefore continuous nowhere near $s=0$ — it is $C^0$ but not $C^1$ in general and
+outright discontinuous here — and no Newton method converges across such a jump. Four
+integration points straddled $s=0$ and drove the whole cycle.
+
+**Fix.** Replace the hard sign with a smooth one of width $\varepsilon$
+(`WOUND_SIGNEPS`, default $0.05$):
+
+$$\mathbf{v}_{\max} \leftarrow \tanh\!\left(\frac{s}{\varepsilon}\right)\mathbf{v}_{\max}.$$
+
+This keeps the orientation convention for $|s| \gg \varepsilon$ and passes smoothly
+through zero, where the *magnitude* also vanishes — which is correct, since when
+$\mathbf{a}_0 \perp \mathbf{v}_{\max}$ there is no preferred rotation sense.
+
+**Evidence.** A controlled A/B at equal wall-clock time gave **38.6 h of simulated
+time with the fix against 0.7 h without — a factor of 55.** The fix is what made the
+four-week runs possible.
+
+**Ruled out by measurement, not by argument** (each was a live hypothesis):
+transport and biology (a mechanics-frozen run completed 27.6 h cleanly); element
+inversion ($\min\det\mathbf{C}^e = 4.7\times10^{-2}$, never $\le 0$); mesh resolution
+(a 167k-dof run behaved identically; mesh quality median 0.764, no slivers); the
+plastic-growth deadband (the branch counters showed its crossing counts do not move
+during a cycle); traction magnitude; `k_cut`; and the local substep count.
+
+### Other fixes in the same round
+
+1. **Wound tagging moved to the reference frame.** Wound nodes and integration points
+   are now identified once, from `myMesh.nodes`, before any deformation, and stored in
+   `wound_sev_node[]` / `wound_sev_ip[]`. Recomputing wound membership on *deformed*
+   coordinates had caused four separate bugs, the worst of which silently seeded
+   almost no wound at all (peak $\alpha$ of 0.061 instead of 0.330) and made a run
+   look successful for entirely the wrong reason. Start-up now prints tagged node and
+   integration-point counts, the radial span, and the percentage of wall thickness
+   pierced, and warns below 90 %.
+2. **Growth bounding and gating** in `local_solver.cpp` — `growthLo`/`growthHi`
+   (`WOUND_LAMP_LO` / `WOUND_LAMP_HI`, default $[0.5, 2.0]$), a saturating
+   $\operatorname{sat}(x,c)=c\tanh(x/c)$ on the band term, and a $\tanh$ gate so the
+   deadband edges are $C^1$. Saturation and gate are folded in at a single site so
+   every downstream sensitivity row stays consistent.
+3. **Branch instrumentation** (`resetBranchStats` / `reportBranchStats`) counting how
+   many integration points sit in each non-smooth branch and how close each is to
+   switching. **A period-two cycle shows one count alternating while the others hold
+   steady** — this is what identified the cause, and it remains available for the next
+   one.
+4. **Residual localisation** (`WOUND_RESLOC`) printing the twenty largest-residual
+   degrees of freedom with field, node, coordinates and distance from the needle axis.
+   This established that the failure was purely mechanical.
+5. **A fixed `X` accumulator bug** in `wound.cpp`: `Vector3d X` was declared outside
+   the integration-point loop but never zeroed inside it, so it accumulated across
+   points.
+
+### Analysis scripts added
+
+| Script | What it measures |
+|---|---|
+| `scripts/check_detFe.py` | exact $\det\mathbf{F}^e$ from $\mathbf{C}^e = 2\mathbf{E}+\mathbf{I}$, plus $J^p$ and the plastic stretches |
+| `scripts/wound_fill.py` | mean and minimum of each field over the wound core against time — the measure that matches the definition of closure |
+| `scripts/plot_species_evolution.py` | four-panel figure of all species at the wound centre, rim and interior average |
+
+**Closure in this model means the defect *fills*** with fibroblasts and collagen, not
+that its edges are pulled together. Myofibroblast traction contracts the wound
+somewhat but never apposes the edges, so the cross-section radius is secondary
+information and a widening cross-section is not by itself a failure.
+
+### Working envelope in active traction
+
+| $t_\rho$ | peak traction | simulated time | rejected steps |
+|---|---|---|---|
+| $\times1$ (calibrated) | 11.7 kPa | 669.6 h complete | 0 |
+| $\times10$ | 117 kPa | 669.6 h complete | 0 |
+| $\times100$ | 1.17 MPa | 118.6 h, stopped | 51 |
+| $\times1000$ | 11.7 MPa | 12 h, stopped | 5 |
+
+**Clean through $\times10$.** At $\times100$ the time step collapses from $0.2$ h to
+$0.008$ h and the run advances one simulated hour per wall-clock hour, against 26 for
+$\times10$. Neither extreme fails outright — both keep converging, only expensively.
+Tissue-level fibroblast traction is 1–10 kPa, so the calibrated $\times1$ value is the
+physically correct one and the upper cases are well past plausibility. The $\times1000$
+limit cycle is a **different mechanism** from the sign flip (relative amplitude 1.5 %
+against 0.04–0.09 %, and several branch margins move together rather than one
+isolating itself); if contracture data ever lands above $\times10$ it needs a fresh
+diagnosis, not a repeat of this fix.
+
+**Physical result of the sweep.** Ten times the traction contracts the wound
+($r_{\text{rms}}$ $-1.59\%$, where $\times1$ widens it) and raises wound-average
+collagen from 0.765 to 0.788 — but the gain is entirely at the rim (0.793 → 0.824)
+while the centre is slightly *lower* (0.735 → 0.725). Stronger traction concentrates
+deposition at the margin rather than filling the core faster. Two data points, not an
+established mechanism.
 
 ---
 
@@ -201,6 +341,45 @@ OpenMP, so those "tasks" are already threads, not ranks.
 
 ---
 
+## Next three items (agreed 2026-08-02)
+
+These are the three open pieces of work to take up next, in no fixed order.
+
+### 1. Fix the quadratic-tetrahedron quadrature rule
+
+`LineQuadriIPTetQuadratic` currently returns **the same rule as the linear case**, so
+ten-node tetrahedra are unusable: the quadratic shape functions are integrated by a
+rule that cannot represent them, leaving **six spurious modes per element**. The linear
+tet needed a degree-2 rule (4-point Keast) to make the mass matrix
+$\int R_i R_j\,\mathrm{d}V$ full rank; the quadratic tet needs **degree 4**, which is
+the 11- or 15-point Keast rule. Until that is in, do not use tet10 — the element will
+appear to run and produce quietly wrong answers, exactly as the 1-point linear rule
+did. See known defect 1 above for what that failure mode looks like.
+
+### 2. Solve the α equation separately
+
+The pro-inflammatory signal obeys
+
+$$\dot\alpha + \nabla\cdot\mathbf{Q}_\alpha = -d_\alpha\alpha,
+\qquad \mathbf{Q}_\alpha = -D_\alpha\nabla\alpha,$$
+
+which is **linear in $\alpha$ and completely uncoupled from $\rho$, $c$, $\phi$ and the
+mechanics** — nothing on the right-hand side depends on any other field, and no other
+field's equation reads $\alpha$ except through the source $p_{c,\alpha}\alpha$ in the
+cytokine equation, which is an explicit forcing rather than a coupling. It therefore
+does not belong in the monolithic Newton system at all. Solving it as a separate
+linear system, once per time step, removes one field from the $4\times4$ block tangent
+and removes its Newton iterations entirely. Expected benefit: a smaller, better
+conditioned monolithic system and a cheaper step. Worth doing before the 20t
+production mesh.
+
+### 3. Parallel assembly (see the detailed plan in the next section)
+
+Steps A–C below. Do **C first** — it is twenty lines of timers and decides whether B
+is worth doing at all.
+
+---
+
 ## Open items
 
 - **The seeded wound never reaches the nominal ICs, and the reported wound
@@ -267,16 +446,12 @@ OpenMP, so those "tasks" are already threads, not ranks.
   edges rather than 1.7). That is physically defensible, since the inflammatory
   signal begins diffusing from the injury immediately and its initial footprint
   is broader than the mechanical damage.
-- **`time_step_ratio = 100` is ~4x more local substeps than needed** and is the
-  dominant runtime cost, especially now that tets carry 4 integration points
-  instead of 1. Per global time step the solver does
-  `100 substeps x 79,364 IPs x ~6 Newton iterations ~ 48 million` local
-  forward-Euler updates. The binding local timescale is `tau_lamdaP` = 0.05 h;
-  at `ratio = 100`, `local_dt` = 0.002 h is 25x finer than that. `ratio = 25`
-  gives `local_dt` = 0.008 h (0.16 of the binding timescale — still comfortable
-  for forward Euler) and would cut wall time ~4x. Worth changing before any
-  production run on the 20t mesh. Note the Newton solve itself is NOT the
-  bottleneck: healing steps converge in 6–7 iterations at residual ~1e-9.
+- ~~**`time_step_ratio = 100` is ~4x more local substeps than needed**~~ — **done.**
+  The default is now **25** (`WOUND_LOCALSUB`), giving `local_dt` = 0.008 h against
+  the binding local timescale `tau_lamdaP` = 0.05 h — a ratio of 0.16, still
+  comfortable for forward Euler — and cutting wall time roughly 4×. The four-week
+  runs used this value. Note the Newton solve itself is NOT the bottleneck: healing
+  steps converge in 6–7 iterations at residual ~1e-9.
 - **`k_cut = 300` makes `C_low` a near-step** (0.0025 → 0.5 → 0.9975 across
   φ = 0 → 0.01 → 0.02, slope ~150 at φ = 0.01). It works, but if convergence
   degrades on finer meshes this is the first thing to soften.
@@ -304,10 +479,22 @@ OpenMP, so those "tasks" are already threads, not ranks.
 - **Four tangent-consistency defects remain** (listed in `CLAUDE.md`), notably
   the double-counted `dThetadrho(5..7)`/`dThetadc(5..7)` in `local_solver.cpp`.
   They affect convergence rate, not the residual.
-- **`plan.md` line 55 sign**: written as `ρ̇ = ∇·Q_ρ + s_ρ` with `Q_ρ = −D_ρ∇ρ`,
-  which is anti-diffusion. The code implements `ρ̇ + ∇·Q_ρ = s_ρ`, consistent
-  with the c and α equations. Worth correcting in `plan.md`.
+- ~~**`plan.md` line 55 sign**~~ — **corrected 2026-08-02.** `plan.md` now reads
+  `ρ̇ + ∇·Q_ρ = s_ρ`, consistent with the c and α equations and with the code. The
+  `H(J^e)` arguments in the c and φ source terms were corrected to `H(θ^e)` at the
+  same time, and the normalized-values section now records what was actually
+  implemented (α_h = 0 exactly, and the tanh seed's 0.9651 peak severity).
 - **`src/cydindrical_dura_single_tissue_multiwound_original.cpp`** has now
   diverged from the driver. Safe to delete.
+- **An inverted element can hide from the nodal VTK output.** In `run_g02` the
+  integration-point `det(F^e)` reached **−0.056** while the nodal field showed a
+  minimum of 0.309 — nodal averaging smooths the extreme away. `run_h02` shows the
+  same gap in benign form (0.0125 at integration points against 0.294 nodal, still
+  positive, no inversion). Always check the solver's own `reportState()` output or
+  `scripts/check_detFe.py`, never the VTK minimum alone.
+- **`run_g02_signfix_full` predates the reference-frame wound tagging** and carries a
+  partial-thickness wound (553 nodes, 41.8 % of the wall) against `run_h01`'s
+  full-thickness one (701 nodes, 99.97 %). The two are **not comparable on recovery
+  depth** and their figures should not be presented side by side without saying so.
 - **Second wound** is not re-enabled; the driver solves a single wound, per
   `plan.md`.
