@@ -33,6 +33,7 @@ struct tissue{
 	std::vector<Vector3d> node_X;
 	std::vector<double> node_rho_0;
 	std::vector<double> node_c_0;
+	std::vector<double> node_alpha_0;   // pro-inflammatory signal
 	//
 	// integration point values
 	// order by element then by integration point of the element
@@ -49,6 +50,7 @@ struct tissue{
 	std::vector<Vector3d> node_x;
 	std::vector<double> node_rho;
 	std::vector<double> node_c;
+	std::vector<double> node_alpha;
 	//
 	// integration point values
 	std::vector<double> ip_phif;
@@ -68,12 +70,14 @@ struct tissue{
 	// essential boundary conditions for concentrations
 	std::map<int,double>  eBC_rho;
 	std::map<int,double>  eBC_c;
+	std::map<int,double>  eBC_alpha;
 	//
 	// traction boundary conditions for displacements
 	std::map<int,double> nBC_x;
 	// traction boundary conditions for concentrations
 	std::map<int,double> nBC_rho;
 	std::map<int,double> nBC_c;
+	std::map<int,double> nBC_alpha;
 
 	// degree of freedom maps
 	//
@@ -83,6 +87,7 @@ struct tissue{
 	// concentrations
 	std::vector< int > dof_fwd_map_rho;
 	std::vector< int > dof_fwd_map_c;
+	std::vector< int > dof_fwd_map_alpha;
 	
 	// all dof inverse map
 	std::vector< std::vector<int> > dof_inv_map;
@@ -101,6 +106,13 @@ struct tissue{
 	double time_step;
 	double time;
 	double tol;
+	// Second convergence test, on the Newton increment. The residual test
+	// alone cannot detect a limit cycle: at the plastic-growth deadband kink
+	// the residual is C0 but not C1, and Newton bounces between two states,
+	// repeating the same residual and the same increment bit-for-bit for
+	// hundreds of iterations. When the increment has collapsed the state has
+	// stopped moving and the step is converged in every practical sense.
+	double tol_inc;
 	int max_iter;
 	
 };

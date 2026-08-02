@@ -12,6 +12,7 @@ This code is the implementation of the DaLaWoHe
 #include <iomanip>
 #include "wound.h"
 #include "local_solver.h"
+#include "mechanosensing.h"
 #include "element_functions.h"
 #include <iostream>
 #include <cmath>
@@ -28,6 +29,149 @@ This code is the implementation of the DaLaWoHe
 #include <Eigen/Dense>
 
 using namespace Eigen;
+
+//========================================================//
+// SMOOTH DEADBAND
+//========================================================//
+// Soft-threshold used for the plastic-growth deadband:
+//
+//     band(x) = softplus(x - hi, w) - softplus(lo - x, w)
+//
+// which is 0 well inside [lo, hi], (x - lo) well below it and (x - hi) well
+// above it - the same shape as the hard if/else it replaces - but with a
+// CONTINUOUS derivative everywhere. w sets the transition width; w -> 0
+// recovers the original piecewise-linear threshold exactly.
+//
+// softplus is evaluated in the overflow-safe form
+//     sp(x) = max(x,0) + log1p(exp(-|x|/w))*w
+// because exp(x/w) with w = 0.01 overflows for x beyond ~7.
+static inline double softplus_w(double x, double w)
+{
+    const double ax = std::fabs(x);
+    return (x > 0.0 ? x : 0.0) + w*std::log1p(std::exp(-ax/w));
+}
+// d/dx softplus_w = logistic(x/w), written so neither branch overflows.
+static inline double dsoftplus_w(double x, double w)
+{
+    const double z = x/w;
+    return (z >= 0.0) ? 1.0/(1.0 + std::exp(-z))
+                      : std::exp(z)/(1.0 + std::exp(z));
+}
+// The deadband map and its derivative.
+static inline double bandVal(double x, double lo, double hi, double w)
+{
+    return softplus_w(x - hi, w) - softplus_w(lo - x, w);
+}
+static inline double bandDer(double x, double lo, double hi, double w)
+{
+    return dsoftplus_w(x - hi, w) + dsoftplus_w(lo - x, w);
+}
+
+//--------------------------------------------------------//
+// GROWTH BOUNDING
+//--------------------------------------------------------//
+//
+// Why this exists. In run_w15, decomposing det(F^e) = J/Jp at the worst node:
+//
+//   t[h]   lamdaE_n   lamdaP_n   lamda_n = lE*lP    Jp
+//    0      0.175      0.959        0.168          0.969
+//   16      0.167      0.650        0.109          0.694    (Jp min over mesh 0.133)
+//
+// The ELASTIC stretch is nearly constant while geometry and growth collapse
+// together: the growth law is chasing a geometric collapse it can never catch.
+// That matters because EVERY stress term in wound.cpp carries Jp as a prefactor
+// (SS_pas, SS_act and SS_vol are all Jp*(...)), so Jp -> 0 removes the element
+// from the stiffness matrix entirely. That is the near-singular tangent the
+// solver has been dying on - not a bifurcation, just elements dissolving.
+//
+// Two things let it run away:
+//   1. bandVal is LINEAR far from the knee, so with lamdaE_n = 0.17 sitting 5x
+//      below the deadband floor of 0.85 the driving term is -0.68 and grows
+//      without limit as lamdaE falls further.
+//   2. lamdaP had NO bound anywhere in the code.
+//
+// satVal caps the driving; growthGate stops lamdaP being pushed past its
+// physical limits. The gate is ONE-SIDED - it only damps motion heading INTO a
+// bound, so lamdaP can always recover back toward the interior.
+//
+// Both are folded into band_a/s/n and their derivatives at the single site where
+// those are computed, so every downstream use (lamdaP_dot and all the dTheta
+// sensitivity rows) stays consistent automatically.
+static inline double growthLo()
+{ static const double v = [](){ const char* e = std::getenv("WOUND_LAMP_LO");
+                                return e ? std::atof(e) : 0.5; }(); return v; }
+static inline double growthHi()
+{ static const double v = [](){ const char* e = std::getenv("WOUND_LAMP_HI");
+                                return e ? std::atof(e) : 2.0; }(); return v; }
+static inline double bandCapMult()
+{ static const double v = [](){ const char* e = std::getenv("WOUND_BANDCAP");
+                                return e ? std::atof(e) : 1.0; }(); return v; }
+
+// Smooth saturation of the driving term: matches x for |x| << cap, bounded by
+// cap. tanh keeps it C-infinity, preserving the C1 residual that the smoothed
+// deadband was introduced to obtain.
+static inline double satVal(double x, double cap)
+{ return (cap > 0.0) ? cap*std::tanh(x/cap) : x; }
+static inline double satDer(double x, double cap)
+{ if(cap <= 0.0) return 1.0; const double t = std::tanh(x/cap); return 1.0 - t*t; }
+
+// One-sided gate on lamdaP. band < 0 shrinks lamdaP, so gate against the lower
+// bound; band > 0 grows it, so gate against the upper.
+static inline double growthGate(double lp, double band, double lo, double hi)
+{
+    const double w = 0.05*(hi - lo);
+    if(band < 0.0) return 0.5*(1.0 + std::tanh((lp - lo)/w));
+    if(band > 0.0) return 0.5*(1.0 + std::tanh((hi - lp)/w));
+    return 1.0;
+}
+
+//--------------------------------------------------------//
+// NON-SMOOTH BRANCH INSTRUMENTATION
+//--------------------------------------------------------//
+//
+// Newton limit-cycles inside a failing step: the residual alternates between two
+// values BIT-FOR-BIT for 200 iterations, e.g. 9.34885e-05 / 9.35687e-05, until
+// max_iter rejects it. That is a slope discontinuity in the residual, not slow
+// convergence and not a singular matrix. Measured cycle amplitude relative to
+// the residual is 8.6e-4 / 4.9e-4 / 4.1e-4 across three runs spanning two orders
+// of magnitude - a PROPORTIONAL signature.
+//
+// There are at least three non-smooth branches in this file that could cause it:
+// the eigenvector sign flip, the eigenvalue-degeneracy nudge, and the deadband.
+// Rather than guess, count how many integration points sit in each branch and
+// how close they are to flipping. A branch whose COUNT alternates between Newton
+// iterations, or whose margin is ~0, is the culprit.
+//
+// Counters are accumulated on the FINAL local substep only (the state Newton
+// actually sees) and merged under one critical per IP, which is the same
+// granularity the element loop already pays.
+namespace {
+struct BranchStats {
+    long n_ip = 0, n_signflip = 0, n_degen = 0;
+    long n_band_a = 0, n_band_s = 0, n_band_n = 0;
+    double min_dot     = 1e30;   // min |a0.vectormax|  -> 0 means sign flip is imminent
+    double min_eiggap  = 1e30;   // min pairwise |lamda_i - lamda_j| (degeneracy margin)
+    double min_bandgap = 1e30;   // min distance of any lamdaE to a deadband edge
+    double worst_x = 0, worst_y = 0, worst_z = 0;  // position of the min-margin IP
+};
+BranchStats g_bs;
+}
+
+void resetBranchStats() { g_bs = BranchStats(); }
+
+void reportBranchStats(const char *tag)
+{
+    std::cout << "  [branch " << tag << "] ips=" << g_bs.n_ip
+              << "  signflip=" << g_bs.n_signflip
+              << "  degen=" << g_bs.n_degen
+              << "  outband a/s/n=" << g_bs.n_band_a << "/" << g_bs.n_band_s
+              << "/" << g_bs.n_band_n
+              << "  | margins dot=" << g_bs.min_dot
+              << " eiggap=" << g_bs.min_eiggap
+              << " bandgap=" << g_bs.min_bandgap
+              << "  worst@(" << g_bs.worst_x << "," << g_bs.worst_y << ","
+              << g_bs.worst_z << ")\n";
+}
 
 
 //========================================================//
@@ -139,8 +283,43 @@ void localWoundProblemExplicit(
     VectorXd dThetadrho_num(8); dThetadrho_num.setZero();
     VectorXd dThetadc_num(8); dThetadc_num.setZero();
     
-    double lowlim= 0.95; // what are these
-    double uplim= 1.05;  // what are these
+    // Deadband for permanent (plastic) growth: no remodelling while the elastic
+    // stretch stays inside [lowlim, uplim].
+    //
+    // These used to be 0.95 / 1.05, which is INCOMPATIBLE with the physiological
+    // prestretch. Healthy dura sits at lamdaE = (1.098, 1.035, 0.880), so the
+    // axial and through-thickness stretches both fall outside [0.95, 1.05] and
+    // plastic growth fires continuously in perfectly healthy tissue, slowly
+    // eating the prestretch (theta_e drifts down and H away from 1/2). The band
+    // must contain the homeostatic elastic stretches, so it is now supplied by
+    // the driver via local_parameters[18]/[19] instead of being hard-coded.
+    double lowlim = (local_parameters.size() > 18) ? local_parameters[18] : 0.85;
+    double uplim  = (local_parameters.size() > 19) ? local_parameters[19] : 1.15;
+
+    // Width of the SMOOTH transition at each band edge.
+    //
+    // The band used to be applied as a hard if/else. That makes lamdaP_dot
+    // continuous - it is zero at the edge - but its slope jumps from 0 inside to
+    // 1 outside, so the residual is C0 and not C1 and the tangent has a genuine
+    // discontinuity in lamdaE. Two symptoms traced back to it:
+    //
+    //   * Newton limit cycles. An integration point sitting on the kink makes
+    //     the iterates alternate between two states, repeating the same residual
+    //     and increment bit-for-bit for hundreds of iterations. Halving dt does
+    //     not help, since the cycle belongs to the state and not the step size.
+    //   * ILU breakdown. A discontinuous Jacobian entry is exactly what makes an
+    //     incomplete factorization useless, and BiCGSTAB then returns garbage -
+    //     sometimes reporting success while doing so.
+    //
+    // Replacing the hard threshold with a softplus blend keeps the same shape
+    // (zero inside, unit slope far outside) but makes the derivative continuous.
+    // The default 0.002 is set by homeostasis, not by taste: the healthy
+    // through-thickness stretch lamdaE_n = 0.880 sits only 0.030 above
+    // lowlim = 0.85, and a softplus edge leaks w*log1p(exp(-0.030/w)) of growth
+    // into the band interior there. w = 0.01 leaks -4.9e-4 and would remodel
+    // healthy tissue continuously; w = 0.002 leaks -6.1e-10. It is still ~200
+    // Newton increments wide, so the solver sees a smooth function.
+    const double band_w = (local_parameters.size() > 20) ? local_parameters[20] : 0.002;
 
     //std::ofstream myfile;
     //myfile.open("FE_results.csv");
@@ -184,14 +363,50 @@ void localWoundProblemExplicit(
         Vector3d vectormax = vectors.col(2);
         Vector3d vectormed = vectors.col(1);
         Vector3d vectormin = vectors.col(0);
-        if (a0.dot(vectormax) < 0) {
+        // INSTRUMENTATION: capture the branch margins before either branch acts.
+        const double bs_dot = a0.dot(vectormax);          // -> 0 means the sign flip is imminent
+        const double bs_eiggap = std::min(std::min(std::abs(lamdamin-lamdamed),
+                                                   std::abs(lamdamin-lamdamax)),
+                                          std::abs(lamdamed-lamdamax));
+        bool bs_signflip = false, bs_degen = false;
+
+        // EIGENVECTOR SIGN CONVENTION - the source of the Newton limit cycle.
+        //
+        // SelfAdjointEigenSolver returns eigenvectors with an arbitrary sign, so
+        // this picks the end of the principal axis nearer a0. Measured: 38465 of
+        // 79844 IPs (48%) take the flip, and the closest sits at
+        // |a0.vectormax| = 0.00137. Four IPs straddle zero and flip EVERY Newton
+        // iteration, which reverses an O(1) contribution to a0_dot and produces
+        // the period-2 residual cycle (signflip alternating 38465/38461 in exact
+        // lockstep with residual 8.98273e-05/8.98608e-05).
+        //
+        // The ambiguity is real, not numerical: at a0 perpendicular to the
+        // principal axis both ends are equidistant, and that is precisely where
+        // |(I-a0a0)*vectormax| is LARGEST - so the hard flip puts its worst
+        // discontinuity exactly where the driving term is strongest.
+        //
+        // WOUND_SIGNEPS replaces sign() with tanh(dot/eps): identical away from
+        // the ambiguous point, and smoothly vanishing at it, which is also the
+        // physically right answer (no preferred end => no preferred rotation).
+        // Set to 0 for the legacy hard flip.
+        static const double sign_eps = [](){
+            const char* e = std::getenv("WOUND_SIGNEPS");
+            return e ? std::atof(e) : 0.05;
+        }();
+        if(sign_eps > 0.0){
+            const double s = std::tanh(bs_dot/sign_eps);
+            if(bs_dot < 0.0) bs_signflip = true;
+            vectormax = s*vectormax;
+        }else if (a0.dot(vectormax) < 0) {
             vectormax = -vectormax;
+            bs_signflip = true;
         }
         // If CC is the identity matrix, the eigenvectors are arbitrary which is problematic.
         // Beware the matrix becoming singular. Need to perturb.
         double epsilon = 1e-7;
         double delta = 1e-7;
         if(abs(lamdamin-lamdamed) < epsilon || abs(lamdamin-lamdamax) < epsilon || abs(lamdamed-lamdamax) < epsilon){
+            bs_degen = true;
             lamdamax = lamdamax*(1+delta);
             lamdamin = lamdamin*(1-delta);
             lamdamed = lamdamed/((1+delta)*(1-delta));
@@ -199,7 +414,12 @@ void localWoundProblemExplicit(
         //std::cout << "\n vectormax" << vectormax << "\n lamdaMax" << lamdamax << "\n";
 
         // Mechanosensing
-        double He = 1./(1.+exp(-gamma_theta*(Je - vartheta_e)));
+        // Mechanosensing stimulus: in-plane AREAL elastic stretch of the dural
+        // mid-surface, theta_e = ||cof(F^e).n0||, NOT det(F^e). The tissue is
+        // treated as incompressible so det(F^e)==1 and could never respond to
+        // membrane stretch. See include/mechanosensing.h.
+        double theta_e = evalThetaE(J, CCinv, n0, lamdaP(0), lamdaP(1));
+        double He = evalHe(theta_e, vartheta_e, gamma_theta);
         //if(He<0.002){He=0;}
 
         //----------------------------//
@@ -255,32 +475,36 @@ void localWoundProblemExplicit(
 //            lamdaP_dot(2) = 0;
 //        }
 
-        // Threshold
-        // lamdaP_a
-        if(lamdaE_a < lowlim){
-            lamdaP_dot(0) = phif_dot_plus*(lamdaE_a-lowlim)/tau_lamdaP_a;
-        } else if(lamdaE_a > uplim){
-            lamdaP_dot(0) = phif_dot_plus*(lamdaE_a-uplim)/tau_lamdaP_a;
-        }
-        else{
-            lamdaP_dot(0) = 0;
-        }
-        // lamdaP_s
-        if(lamdaE_s < lowlim){
-            lamdaP_dot(1) = phif_dot_plus*(lamdaE_s-lowlim)/tau_lamdaP_s;
-        } else if(lamdaE_s > uplim){
-            lamdaP_dot(1) = phif_dot_plus*(lamdaE_s-uplim)/tau_lamdaP_s;
-        }else{
-            lamdaP_dot(1) = 0;
-        }
-        // lamdaP_n
-        if(lamdaE_n < lowlim){
-            lamdaP_dot(2) = phif_dot_plus*(lamdaE_n-lowlim)/tau_lamdaP_n;
-        } else if(lamdaE_n > uplim){
-            lamdaP_dot(2) = phif_dot_plus*(lamdaE_n-uplim)/tau_lamdaP_n;
-        }else{
-            lamdaP_dot(2) = 0;
-        }
+        // Smooth deadband (see band_w above). band_a/s/n are the soft-threshold
+        // values that replace the old (lamdaE - lim) branches; band_*_der are
+        // their derivatives, needed by the tangent below. Computed once here so
+        // the residual and every chain-rule site use the same numbers.
+        // Raw deadband, then saturated (bounds the RATE) and gated (bounds the
+        // STATE). See the growth-bounding block at the top of this file: both
+        // are needed - saturation alone still lets lamdaP drift to zero given
+        // time, and gating alone leaves an arbitrarily stiff driving term.
+        const double band_a_raw = bandVal(lamdaE_a, lowlim, uplim, band_w);
+        const double band_s_raw = bandVal(lamdaE_s, lowlim, uplim, band_w);
+        const double band_n_raw = bandVal(lamdaE_n, lowlim, uplim, band_w);
+        const double bcap  = bandCapMult()*(uplim - lowlim);
+        const double g_lo  = growthLo(), g_hi = growthHi();
+        const double gate_a = growthGate(lamdaP(0), band_a_raw, g_lo, g_hi);
+        const double gate_s = growthGate(lamdaP(1), band_s_raw, g_lo, g_hi);
+        const double gate_n = growthGate(lamdaP(2), band_n_raw, g_lo, g_hi);
+
+        const double band_a = gate_a*satVal(band_a_raw, bcap);
+        const double band_s = gate_s*satVal(band_s_raw, bcap);
+        const double band_n = gate_n*satVal(band_n_raw, bcap);
+        // Chain rule: d(gate*sat(raw))/dlamdaE = gate*sat'(raw)*d(raw)/dlamdaE.
+        // The dgate/dlamdaP term is dropped, consistent with lamdaP being held
+        // explicit within a substep.
+        const double band_a_der = gate_a*satDer(band_a_raw, bcap)*bandDer(lamdaE_a, lowlim, uplim, band_w);
+        const double band_s_der = gate_s*satDer(band_s_raw, bcap)*bandDer(lamdaE_s, lowlim, uplim, band_w);
+        const double band_n_der = gate_n*satDer(band_n_raw, bcap)*bandDer(lamdaE_n, lowlim, uplim, band_w);
+
+        lamdaP_dot(0) = phif_dot_plus*band_a/tau_lamdaP_a;
+        lamdaP_dot(1) = phif_dot_plus*band_s/tau_lamdaP_s;
+        lamdaP_dot(2) = phif_dot_plus*band_n/tau_lamdaP_n;
             
 
         //----------------------------------------//
@@ -318,12 +542,24 @@ void localWoundProblemExplicit(
             }
         }
 
+        // Chain rule from CCe back to CC.  CCe = Fg^-1 CC Fg^-1 with Fg^-1
+        // symmetric, so
+        //     dCCe_ij/dCC_kl = Fginv_ik Fginv_lj
+        // and  df/dCC_kl = sum_ij (df/dCCe_ij) Fginv_ik Fginv_lj.
+        //
+        // This used to ASSIGN rather than accumulate over (ii,jj) - so only the
+        // last term, (ii,jj) = (2,2), survived out of nine - and it paired the
+        // indices as Fginv(ii,jj)*Fginv(kk,ll), which is not the chain rule at
+        // all. These derivatives feed dThetadCC and hence Ke_x_x, Ke_rho_x and
+        // Ke_c_x, so the global tangent was wrong wherever the fiber frame
+        // rotates: Newton converged linearly instead of quadratically, grinding
+        // past 200 iterations on stiff steps.
         for (int ii=0; ii<3; ii++){
             for (int jj=0; jj<3; jj++) {
                 for (int kk=0; kk<3; kk++){
                     for (int ll=0; ll<3; ll++) {
                         for (int mm=0; mm<3; mm++) {
-                            dvectormaxdCC[mm](kk,ll) = dvectormaxdCCe[mm](ii,jj)*(FFginv(ii,jj)*FFginv(kk,ll));
+                            dvectormaxdCC[mm](kk,ll) += dvectormaxdCCe[mm](ii,jj)*FFginv(ii,kk)*FFginv(ll,jj);
                         }
                     }
                 }
@@ -343,9 +579,10 @@ void localWoundProblemExplicit(
             for (int jj=0; jj<3; jj++) {
                 for (int kk=0; kk<3; kk++){
                     for (int ll=0; ll<3; ll++) {
-                        dlamdamaxdCC(kk,ll) = dlamdamaxdCCe(ii,jj)*(FFginv(ii,jj)*FFginv(kk,ll));
-                        dlamdameddCC(kk,ll) = dlamdameddCCe(ii,jj)*(FFginv(ii,jj)*FFginv(kk,ll));
-                        dlamdamindCC(kk,ll) = dlamdamindCCe(ii,jj)*(FFginv(ii,jj)*FFginv(kk,ll));
+                        // same correction as for dvectormaxdCC above
+                        dlamdamaxdCC(kk,ll) += dlamdamaxdCCe(ii,jj)*FFginv(ii,kk)*FFginv(ll,jj);
+                        dlamdameddCC(kk,ll) += dlamdameddCCe(ii,jj)*FFginv(ii,kk)*FFginv(ll,jj);
+                        dlamdamindCC(kk,ll) += dlamdamindCCe(ii,jj)*FFginv(ii,kk)*FFginv(ll,jj);
                     }
                 }
             }
@@ -372,7 +609,8 @@ void localWoundProblemExplicit(
         // Calculate derivative of He wrt to CC. If this is the same H, this is the same as in the main code.
         Matrix3d dHedCC_explicit, dphifdotplusdCC; dHedCC_explicit.setZero(); dphifdotplusdCC.setZero();
         phif_dot_plus = (p_phi + (p_phi_c*c)/(K_phi_c+c) + p_phi_theta*He)*(rho/(K_phi_rho+phif));
-        dHedCC_explicit = (-1./pow((1.+exp(-gamma_theta*(Je - vartheta_e))),2))*(exp(-gamma_theta*(Je - vartheta_e)))*(-gamma_theta)*(J*CCinv/(2*Jp));
+        // dH/dCC = gamma_e H (1-H) dtheta_e/dCC  (was dJe/dCC = J CCinv/(2 Jp))
+        dHedCC_explicit = evalDHedCC(theta_e, He, gamma_theta, CCinv, n0);
         dphifdotplusdCC = p_phi_theta*dHedCC_explicit*(rho/(K_phi_rho+phif));
         //std::cout<<"RHO " << rho << " p_phi_theta " << p_phi_theta << " dHedCC_explicit " << dHedCC_explicit << " CCinv " << CCinv;
 
@@ -406,8 +644,28 @@ void localWoundProblemExplicit(
             dThetadCC(12+II) += local_dt*da0dCC[1](ii,jj);
             dThetadCC(18+II) += local_dt*da0dCC[2](ii,jj);
             // kappa
-            dThetadCC(24+II) += (local_dt/(tau_kappa))*((dphifdotplusdCC(ii,jj)*(pow(lamdamed/lamdamax,gamma_kappa)/3. - kappa))
-                                                        + ((phif_dot_plus/3.)*(pow(dlamdameddCC(ii,jj)/lamdamax,gamma_kappa) - pow(lamdamed*dlamdamaxdCC(ii,jj)/(lamdamax*lamdamax),gamma_kappa))));
+            // kappa evolves toward (lamdamed/lamdamax)^gamma_kappa / 3, so the
+            // CC-derivative of that target is
+            //     gamma*(r)^(gamma-1) * dr/dCC,     r = lamdamed/lamdamax
+            //     dr/dCC = dlamdamed/dCC / lamdamax
+            //              - lamdamed * dlamdamax/dCC / lamdamax^2
+            // The exponent becomes a MULTIPLYING factor; it does not apply to
+            // the derivative. This used to read
+            //     pow(dlamdameddCC/lamdamax, gamma) - pow(lamdamed*dlamdamaxdCC/lamdamax^2, gamma)
+            // i.e. it raised the derivative itself to the fifth power
+            // (gamma_kappa = 5) and differenced the two pieces before applying
+            // the chain rule rather than after. Caught by tests/test_tangent:
+            // freezing the structural response made Ke_x_x exact, and within
+            // that the error tracked the fiber dispersion.
+            {
+                const double r      = lamdamed/lamdamax;
+                const double drdCC  = dlamdameddCC(ii,jj)/lamdamax
+                                    - lamdamed*dlamdamaxdCC(ii,jj)/(lamdamax*lamdamax);
+                const double dtarget = gamma_kappa*std::pow(r, gamma_kappa-1.0)*drdCC;
+                dThetadCC(24+II) += (local_dt/(tau_kappa))*(
+                                      (dphifdotplusdCC(ii,jj)*(std::pow(r,gamma_kappa)/3. - kappa))
+                                    + ((phif_dot_plus/3.)*dtarget));
+            }
 //            // No threshold
 //            // lamdaPa, lamdaPs, lamdaPn
 //            dThetadCC(30+II) += (local_dt/tau_lamdaP_a)*((dphifdotplusdCC(ii,jj)*(lamdaE_a-1)) + (phif_dot_plus*(dlamdaE_a_dCC(ii,jj))));
@@ -436,29 +694,23 @@ void localWoundProblemExplicit(
 
             // Threshold
             // lamdaP_a
-            if(lamdaE_a < lowlim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-                dThetadCC(30+II) += (local_dt/tau_lamdaP_a)*((dphifdotplusdCC(ii,jj)*(lamdaE_a-lowlim)) + (phif_dot_plus*(dlamdaE_a_dCC(ii,jj))));
-            } else if(lamdaE_a > uplim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-                dThetadCC(30+II) += (local_dt/tau_lamdaP_a)*((dphifdotplusdCC(ii,jj)*(lamdaE_a-uplim)) + (phif_dot_plus*(dlamdaE_a_dCC(ii,jj))));
-            } else{
-                dThetadCC(30+II) = 0;
-            }
+            // Smooth deadband: the threshold value becomes band_a, and the
+            // dlamdaE term picks up band_a_der, which the hard branch left
+            // implicit at 1 inside each linear arm.
+            dThetadCC(30+II) += (local_dt/tau_lamdaP_a)*((dphifdotplusdCC(ii,jj)*band_a)
+                              + (phif_dot_plus*band_a_der*dlamdaE_a_dCC(ii,jj)));
             // lamdaP_s
-            if(lamdaE_s < lowlim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
-                dThetadCC(36+II) += (local_dt/tau_lamdaP_s)*((dphifdotplusdCC(ii,jj)*(lamdaE_s-lowlim)) + (phif_dot_plus*(dlamdaE_s_dCC(ii,jj))));
-            } else if(lamdaE_s > uplim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
-                dThetadCC(36+II) += (local_dt/tau_lamdaP_s)*((dphifdotplusdCC(ii,jj)*(lamdaE_s-uplim)) + (phif_dot_plus*(dlamdaE_s_dCC(ii,jj))));
-            } else{
-                dThetadCC(36+II) = 0;
-            }
+            // Smooth deadband: the threshold value becomes band_s, and the
+            // dlamdaE term picks up band_s_der, which the hard branch left
+            // implicit at 1 inside each linear arm.
+            dThetadCC(36+II) += (local_dt/tau_lamdaP_s)*((dphifdotplusdCC(ii,jj)*band_s)
+                              + (phif_dot_plus*band_s_der*dlamdaE_s_dCC(ii,jj)));
             // lamdaP_n
-            if(lamdaE_n < lowlim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-                dThetadCC(42+II) += (local_dt/tau_lamdaP_n)*((dphifdotplusdCC(ii,jj)*(lamdaE_n-lowlim)) + (phif_dot_plus*(dlamdaE_n_dCC(ii,jj))));
-            } else if(lamdaE_n > uplim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-                dThetadCC(42+II) += (local_dt/tau_lamdaP_n)*((dphifdotplusdCC(ii,jj)*(lamdaE_n-uplim)) + (phif_dot_plus*(dlamdaE_n_dCC(ii,jj))));
-            } else{
-                dThetadCC(42+II) = 0;
-            }
+            // Smooth deadband: the threshold value becomes band_n, and the
+            // dlamdaE term picks up band_n_der, which the hard branch left
+            // implicit at 1 inside each linear arm.
+            dThetadCC(42+II) += (local_dt/tau_lamdaP_n)*((dphifdotplusdCC(ii,jj)*band_n)
+                              + (phif_dot_plus*band_n_der*dlamdaE_n_dCC(ii,jj)));
 	    //for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
               //  double z_coord = myMesh.nodes[nodei](2);
                 //if(z_coord<1e-30){
@@ -486,10 +738,15 @@ void localWoundProblemExplicit(
         dThetadrho(2) += local_dt*(((2.*PIE)/(tau_omega))*lamdamax*(Matrix3d::Identity()-a0a0)*(vectormax))(1)*dphifdotplusdrho;
         dThetadrho(3) += local_dt*(((2.*PIE)/(tau_omega))*lamdamax*(Matrix3d::Identity()-a0a0)*(vectormax))(2)*dphifdotplusdrho;
         dThetadrho(4) += local_dt*(1/tau_kappa)*( pow(lamdamed/lamdamax,gamma_kappa)/3. - kappa)*dphifdotplusdrho;
-        // No threshold
-        dThetadrho(5) += local_dt*((lamdaE_a-1)/tau_lamdaP_a)*dphifdotplusdrho;
-        dThetadrho(6) += local_dt*((lamdaE_s-1)/tau_lamdaP_s)*dphifdotplusdrho;
-        dThetadrho(7) += local_dt*((lamdaE_n-1)/tau_lamdaP_n)*dphifdotplusdrho;
+        // NOTE: an un-thresholded (lamdaE - 1) contribution used to be added to
+        // slots 5..7 here, on top of the thresholded one added below - so every
+        // subcycle accumulated the derivative TWICE, and the two terms were not
+        // even the same function. The residual uses
+        //     lamdaP_dot = phif_dot_plus * band(lamdaE) / tau
+        // and band() is zero inside the tolerance range while (lamdaE - 1) is
+        // not, so the stray term claimed a sensitivity to growth that was not
+        // occurring at all. Healthy tissue sits at lamdaE = (1.098, 1.035,
+        // 0.880), i.e. (lamdaE - 1) of up to 0.12 against a band value of 0.
 
 //        // Threshold
 //        // lamdaP_a
@@ -513,29 +770,11 @@ void localWoundProblemExplicit(
 
         // Threshold
         // lamdaP_a
-        if(lamdaE_a < lowlim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-            dThetadrho(5) += local_dt*((lamdaE_a-lowlim)/tau_lamdaP_a)*dphifdotplusdrho;
-        } else if(lamdaE_a > uplim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-            dThetadrho(5) += local_dt*((lamdaE_a-uplim)/tau_lamdaP_a)*dphifdotplusdrho;
-        }else{
-            dThetadrho(5) = 0;
-        }
+        dThetadrho(5) += local_dt*(band_a/tau_lamdaP_a)*dphifdotplusdrho;
         // lamdaP_s
-        if(lamdaE_s < lowlim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
-            dThetadrho(6) += local_dt*((lamdaE_s-lowlim)/tau_lamdaP_s)*dphifdotplusdrho;
-        } else if(lamdaE_s > uplim){ //  && (lamdaE_s < uplim && lamdaE_s > lowlim)
-            dThetadrho(6) += local_dt*((lamdaE_s-uplim)/tau_lamdaP_s)*dphifdotplusdrho;
-        } else{
-            dThetadrho(6) = 0;
-        }
+        dThetadrho(6) += local_dt*(band_s/tau_lamdaP_s)*dphifdotplusdrho;
         // lamdaP_n
-        if(lamdaE_n < lowlim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-            dThetadrho(7) += local_dt*((lamdaE_n-lowlim)/tau_lamdaP_n)*dphifdotplusdrho;
-        } else if(lamdaE_n > uplim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-            dThetadrho(7) += local_dt*((lamdaE_n-uplim)/tau_lamdaP_n)*dphifdotplusdrho;
-        } else{
-            dThetadrho(7) = 0;
-        }
+        dThetadrho(7) += local_dt*(band_n/tau_lamdaP_n)*dphifdotplusdrho;
 
 
 	//for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
@@ -562,10 +801,15 @@ void localWoundProblemExplicit(
         dThetadc(2) += local_dt*(((2.*PIE)/(tau_omega))*lamdamax*(Matrix3d::Identity()-a0a0)*(vectormax))(1)*dphifdotplusdc;
         dThetadc(3) += local_dt*(((2.*PIE)/(tau_omega))*lamdamax*(Matrix3d::Identity()-a0a0)*(vectormax))(2)*dphifdotplusdc;
         dThetadc(4) += local_dt*(1/tau_kappa)*( pow(lamdamed/lamdamax,gamma_kappa)/3. - kappa)*dphifdotplusdc;
-        // No threshold
-        dThetadc(5) += local_dt*((lamdaE_a-1)/tau_lamdaP_a)*dphifdotplusdc;
-        dThetadc(6) += local_dt*((lamdaE_s-1)/tau_lamdaP_s)*dphifdotplusdc;
-        dThetadc(7) += local_dt*((lamdaE_n-1)/tau_lamdaP_n)*dphifdotplusdc;
+        // NOTE: an un-thresholded (lamdaE - 1) contribution used to be added to
+        // slots 5..7 here, on top of the thresholded one added below - so every
+        // subcycle accumulated the derivative TWICE, and the two terms were not
+        // even the same function. The residual uses
+        //     lamdaP_dot = phif_dot_plus * band(lamdaE) / tau
+        // and band() is zero inside the tolerance range while (lamdaE - 1) is
+        // not, so the stray term claimed a sensitivity to growth that was not
+        // occurring at all. Healthy tissue sits at lamdaE = (1.098, 1.035,
+        // 0.880), i.e. (lamdaE - 1) of up to 0.12 against a band value of 0.
 
 //        // Threshold
 //        // lamdaP_a
@@ -589,29 +833,11 @@ void localWoundProblemExplicit(
 
         // Threshold
         // lamdaP_a
-        if(lamdaE_a < lowlim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-            dThetadc(5) += local_dt*((lamdaE_a-lowlim)/tau_lamdaP_a)*dphifdotplusdc;
-        } else if(lamdaE_a > uplim){ // && (lamdaE_a < uplim && lamdaE_a > lowlim)
-            dThetadc(5) += local_dt*((lamdaE_a-uplim)/tau_lamdaP_a)*dphifdotplusdc;
-        } else{
-            dThetadc(5) = 0;
-        }
+        dThetadc(5) += local_dt*(band_a/tau_lamdaP_a)*dphifdotplusdc;
         // lamdaP_s
-        if(lamdaE_s < lowlim){ // && (lamdaE_s < uplim && lamdaE_s > lowlim)
-            dThetadc(6) += local_dt*((lamdaE_s-lowlim)/tau_lamdaP_s)*dphifdotplusdc;
-        } else if(lamdaE_s > uplim){ // && (lamdaE_s < uplim && lamdaE_s > lowlim)
-            dThetadc(6) += local_dt*((lamdaE_s-uplim)/tau_lamdaP_s)*dphifdotplusdc;
-        } else{
-            dThetadc(6) = 0;
-        }
+        dThetadc(6) += local_dt*(band_s/tau_lamdaP_s)*dphifdotplusdc;
         // lamdaP_n
-        if(lamdaE_n < lowlim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-            dThetadc(7) += local_dt*((lamdaE_n-lowlim)/tau_lamdaP_n)*dphifdotplusdc;
-        } else if(lamdaE_n > uplim){ // && (lamdaE_n < uplim && lamdaE_n > lowlim)
-            dThetadc(7) += local_dt*((lamdaE_n-uplim)/tau_lamdaP_n)*dphifdotplusdc;
-        } else{
-            dThetadc(7) = 0;
-        }
+        dThetadc(7) += local_dt*(band_n/tau_lamdaP_n)*dphifdotplusdc;
 
 
 	/*for(int nodei=0;nodei<myMesh.n_nodes;nodei++){
@@ -744,6 +970,30 @@ void localWoundProblemExplicit(
 
         // Permanent deformation LAMDAP
         lamdaP = lamdaP + local_dt*(lamdaP_dot);
+
+        // INSTRUMENTATION: merge this IP's branch state on the FINAL substep -
+        // that is the state the global Newton iteration actually sees.
+        if(step == (int)time_step_ratio - 1){
+            auto edge = [&](double le){ return std::min(std::abs(le-lowlim),
+                                                        std::abs(le-uplim)); };
+            const double bs_bandgap = std::min(std::min(edge(lamdaE_a), edge(lamdaE_s)),
+                                               edge(lamdaE_n));
+#pragma omp critical
+            {
+                g_bs.n_ip++;
+                if(bs_signflip) g_bs.n_signflip++;
+                if(bs_degen)    g_bs.n_degen++;
+                if(band_a_raw != 0.0) g_bs.n_band_a++;
+                if(band_s_raw != 0.0) g_bs.n_band_s++;
+                if(band_n_raw != 0.0) g_bs.n_band_n++;
+                if(std::abs(bs_dot) < g_bs.min_dot) g_bs.min_dot = std::abs(bs_dot);
+                if(bs_eiggap < g_bs.min_eiggap)     g_bs.min_eiggap = bs_eiggap;
+                if(bs_bandgap < g_bs.min_bandgap){
+                    g_bs.min_bandgap = bs_bandgap;
+                    g_bs.worst_x = X(0); g_bs.worst_y = X(1); g_bs.worst_z = X(2);
+                }
+            }
+        }
 
         //std::cout << "\nphif: " << phif << ", kappa: " << kappa << ", lamdaP:" << lamdaP(0) << "," << lamdaP(1) << "," << lamdaP(2)
         //          << ",a0:" << a0(0) << "," << a0(1) << "," << a0(2) << ",s0:" << s0(0) << "," << s0(1) << "," << s0(2) << ",n0:" << n0(0) << "," << n0(1) << "," << n0(2) << "\n";

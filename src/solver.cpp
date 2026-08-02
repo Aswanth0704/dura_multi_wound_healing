@@ -10,15 +10,21 @@
 #include <iostream>
 #include <fstream>
 #include <string>
-#include <stdexcept> 
+#include <stdexcept>
 #include <cmath>
+#include <cstdlib>
+#include <algorithm>
+#include <sstream>
 #include "wound.h"
 #include "solver.h"
+#include "local_solver.h"   // resetBranchStats / reportBranchStats
 #include "element_functions.h"
 #include "file_io.h"
 #include <Eigen/Core>
 #include <Eigen/Sparse> // functions for solution of linear systems
 #include <Eigen/OrderingMethods>
+#include <Eigen/IterativeLinearSolvers>
+#include <Eigen/SparseLU>
 typedef Eigen::SparseMatrix<double> SpMat; // declares a column-major sparse matrix type of double
 typedef Eigen::Triplet<double> T;
 
@@ -46,6 +52,7 @@ void fillDOFmap(tissue &myTissue)
 	// concentrations
 	std::vector< int > dof_fwd_map_rho(n_node,-1);
 	std::vector< int > dof_fwd_map_c(n_node,-1);
+	std::vector< int > dof_fwd_map_alpha(n_node,-1);
 		
 	// all dof inverse map
 	std::vector< std::vector<int> > dof_inv_map;
@@ -90,10 +97,21 @@ void fillDOFmap(tissue &myTissue)
 			// this node is in fact in the eBC, 
 			myTissue.node_c[i] = myTissue.eBC_c.find(i)->second;
 		}
+		// pro-inflammatory signal alpha: dof_inv_map tag 3
+		if(myTissue.eBC_alpha.find(i)==myTissue.eBC_alpha.end())
+		{
+			dof_fwd_map_alpha[i] = dof_count;
+			std::vector<int> dofinvalpha = {3,i};
+			dof_inv_map.push_back(dofinvalpha);
+			dof_count+=1;
+		}else{
+			myTissue.node_alpha[i] = myTissue.eBC_alpha.find(i)->second;
+		}
 	}
 	myTissue.dof_fwd_map_x = dof_fwd_map_x;
 	myTissue.dof_fwd_map_rho = dof_fwd_map_rho;
 	myTissue.dof_fwd_map_c = dof_fwd_map_c;
+	myTissue.dof_fwd_map_alpha = dof_fwd_map_alpha;
 	myTissue.dof_inv_map = dof_inv_map;
 	myTissue.n_dof = dof_count;
 }
@@ -291,9 +309,19 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
     //SparseMatrix<double> KK2(n_dof,n_dof);
     //SparseMatrix<double,ColMajor> KK2(n_dof,n_dof); // ColMajor for SparseLU
 
-    BiCGSTAB<SparseMatrix<double, RowMajor> > BICGsolver; // Try with or without preconditioner , Eigen::IncompleteLUT<double>
-    //PardisoLU<SparseMatrix<double>> pardisoLUsolver;
-    //SparseLU<SparseMatrix<double, ColMajor>, COLAMDOrdering<int> > SparseLUsolver;
+    // Seeding a wound drops phif from 1 to 0.01, and the passive stress scales
+    // with phif, so the tangent picks up a ~100x stiffness contrast on top of
+    // the mechanics/transport block scaling. Unpreconditioned BiCGSTAB
+    // stagnates on that and reports NoConvergence. An incomplete-LU
+    // preconditioner handles it; a direct SparseLU is kept as a fallback for
+    // the rare step where the iterative solve still fails, which is much
+    // cheaper than the alternative of repeatedly halving the time step.
+    BiCGSTAB<SparseMatrix<double, RowMajor>, IncompleteLUT<double> > BICGsolver;
+    BICGsolver.preconditioner().setDroptol(1e-5);
+    BICGsolver.preconditioner().setFillfactor(20);
+    BICGsolver.setMaxIterations(2000);
+    BICGsolver.setTolerance(1e-10);
+    SparseLU<SparseMatrix<double, ColMajor>, COLAMDOrdering<int> > SparseLUsolver;
 
 	//std::cout<<"start parameters\n";
 	// PARAMETERS FOR THE SIMULATION
@@ -322,6 +350,13 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
     int iter;
 	for(int step=0;step<total_steps;step++)
 	{
+		// Snapshot the deformed geometry for this step. The rollback below
+		// restores node_rho, node_c and every IP variable from their _0 copies,
+		// but node_x has no _0 counterpart and used to be left at the diverged
+		// value - so each retry restarted from garbage and the adaptive time
+		// step could never recover.
+		std::vector<Vector3d> node_x_step = myTissue.node_x;
+
 		// GLOBAL NEWTON-RAPHSON ITERATION
 		iter = 0;
 		double residuum  = 1.;
@@ -352,6 +387,9 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             KK2.setZero();
             RR.setZero();
             KK_triplets.clear();
+            // Branch instrumentation: reset before the element loop so the counts
+            // reported below describe exactly this Newton iteration.
+            resetBranchStats();
             SOL.setZero();
             std::vector<double> node_phi(myTissue.n_node,0); node_phi.clear();
             std::vector<int> node_ip_count(myTissue.n_node,0); node_ip_count.clear();
@@ -378,6 +416,8 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 std::vector<double> node_c_0_ni; node_c_0_ni.clear();
                 std::vector<double> node_rho_ni; node_rho_ni.clear();
                 std::vector<double> node_c_ni; node_c_ni.clear();
+                std::vector<double> node_alpha_0_ni; node_alpha_0_ni.clear();
+                std::vector<double> node_alpha_ni; node_alpha_ni.clear();
 
                 // values of the structural variables at the IP
                 std::vector<double> ip_phif_0_pi; ip_phif_0_pi.clear();
@@ -410,6 +450,8 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                     node_c_0_ni.push_back(myTissue.node_c_0[elem_ei[ni]]);
                     node_rho_ni.push_back(myTissue.node_rho[elem_ei[ni]]);
                     node_c_ni.push_back(myTissue.node_c[elem_ei[ni]]);
+                    node_alpha_0_ni.push_back(myTissue.node_alpha_0[elem_ei[ni]]);
+                    node_alpha_ni.push_back(myTissue.node_alpha[elem_ei[ni]]);
                 }
 
 				for(int ipi=0;ipi<IP_size;ipi++){
@@ -434,6 +476,7 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 VectorXd Re_x(n_coord*elem_size); Re_x.setZero();
                 VectorXd Re_rho(elem_size); Re_rho.setZero();
                 VectorXd Re_c(elem_size); Re_c.setZero();
+                VectorXd Re_alpha(elem_size); Re_alpha.setZero();
 
                 // pieces of the Tangents
                 MatrixXd Ke_x_x(n_coord*elem_size,n_coord*elem_size); Ke_x_x.setZero();
@@ -445,6 +488,13 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 MatrixXd Ke_c_x(elem_size,n_coord*elem_size); Ke_c_x.setZero();
                 MatrixXd Ke_c_rho(elem_size,elem_size); Ke_c_rho.setZero();
                 MatrixXd Ke_c_c(elem_size,elem_size); Ke_c_c.setZero();
+                MatrixXd Ke_x_alpha(n_coord*elem_size,elem_size); Ke_x_alpha.setZero();
+                MatrixXd Ke_rho_alpha(elem_size,elem_size); Ke_rho_alpha.setZero();
+                MatrixXd Ke_c_alpha(elem_size,elem_size); Ke_c_alpha.setZero();
+                MatrixXd Ke_alpha_x(elem_size,n_coord*elem_size); Ke_alpha_x.setZero();
+                MatrixXd Ke_alpha_rho(elem_size,elem_size); Ke_alpha_rho.setZero();
+                MatrixXd Ke_alpha_c(elem_size,elem_size); Ke_alpha_c.setZero();
+                MatrixXd Ke_alpha_alpha(elem_size,elem_size); Ke_alpha_alpha.setZero();
 
             	// subroutines to evaluate the element
             	//
@@ -453,16 +503,17 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             	time_step, time, time_final,
             	myTissue.elem_jac_IP[ei],
             	myTissue.global_parameters,myTissue.local_parameters,
-                ip_strain, ip_stress, node_rho_0_ni,node_c_0_ni, //
+                ip_strain, ip_stress, node_rho_0_ni,node_c_0_ni,node_alpha_0_ni, //
             	ip_phif_0_pi,ip_a0_0_pi,ip_s0_0_pi,ip_n0_0_pi,ip_kappa_0_pi,ip_lamdaP_0_pi, //
-            	node_rho_ni, node_c_ni,
+            	node_rho_ni, node_c_ni, node_alpha_ni,
             	ip_phif_pi,ip_a0_pi,ip_s0_pi,ip_n0_pi,ip_kappa_pi,ip_lamdaP_pi, //
                 ip_lamdaE_pi,
             	node_x_ni,node_X_ni,
                 ip_dphifdu, ip_dphifdrho, ip_dphifdc,
-            	Re_x, Ke_x_x, Ke_x_rho, Ke_x_c,
-            	Re_rho, Ke_rho_x, Ke_rho_rho, Ke_rho_c,
-            	Re_c, Ke_c_x, Ke_c_rho, Ke_c_c);
+            	Re_x, Ke_x_x, Ke_x_rho, Ke_x_c, Ke_x_alpha,
+            	Re_rho, Ke_rho_x, Ke_rho_rho, Ke_rho_c, Ke_rho_alpha,
+            	Re_c, Ke_c_x, Ke_c_rho, Ke_c_c, Ke_c_alpha,
+            	Re_alpha, Ke_alpha_x, Ke_alpha_rho, Ke_alpha_c, Ke_alpha_alpha);
 
 				//std::cout<<"Ke_x_x\n"<<Ke_x_x<<"\n";
 				//std::cout<<"Ke_x_rho\n"<<Ke_x_rho<<"\n";
@@ -523,6 +574,11 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 									T K_x_c_nici_nj = {myTissue.dof_fwd_map_x[elem_ei[nodei]*n_coord+coordi],myTissue.dof_fwd_map_c[elem_ei[nodej]],Ke_x_c(nodei*n_coord+coordi,nodej)};
 									KK_triplets.push_back(K_x_c_nici_nj);
 								}
+								// alpha tangent
+								if(myTissue.dof_fwd_map_alpha[elem_ei[nodej]]>-1){
+									T K_x_alpha_nici_nj = {myTissue.dof_fwd_map_x[elem_ei[nodei]*n_coord+coordi],myTissue.dof_fwd_map_alpha[elem_ei[nodej]],Ke_x_alpha(nodei*n_coord+coordi,nodej)};
+									KK_triplets.push_back(K_x_alpha_nici_nj);
+								}
 							}
 						}
 					}
@@ -545,6 +601,10 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 								T K_rho_c_ni_nj = {myTissue.dof_fwd_map_rho[elem_ei[nodei]],myTissue.dof_fwd_map_c[elem_ei[nodej]],Ke_rho_c(nodei,nodej)};
 								KK_triplets.push_back(K_rho_c_ni_nj);
 							}
+							if(myTissue.dof_fwd_map_alpha[elem_ei[nodej]]>-1){
+								T K_rho_alpha_ni_nj = {myTissue.dof_fwd_map_rho[elem_ei[nodei]],myTissue.dof_fwd_map_alpha[elem_ei[nodej]],Ke_rho_alpha(nodei,nodej)};
+								KK_triplets.push_back(K_rho_alpha_ni_nj);
+							}
 						}
 					}
 					// ASSEMBLE C
@@ -565,6 +625,34 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 							if(myTissue.dof_fwd_map_c[elem_ei[nodej]]>-1){
 								T K_c_c_ni_nj = {myTissue.dof_fwd_map_c[elem_ei[nodei]],myTissue.dof_fwd_map_c[elem_ei[nodej]],Ke_c_c(nodei,nodej)};
 								KK_triplets.push_back(K_c_c_ni_nj);
+							}
+							if(myTissue.dof_fwd_map_alpha[elem_ei[nodej]]>-1){
+								T K_c_alpha_ni_nj = {myTissue.dof_fwd_map_c[elem_ei[nodei]],myTissue.dof_fwd_map_alpha[elem_ei[nodej]],Ke_c_alpha(nodei,nodej)};
+								KK_triplets.push_back(K_c_alpha_ni_nj);
+							}
+						}
+					}
+					// ASSEMBLE ALPHA
+					if(myTissue.dof_fwd_map_alpha[elem_ei[nodei]]>-1){
+						RR(myTissue.dof_fwd_map_alpha[elem_ei[nodei]]) += Re_alpha(nodei);
+						for(int nodej=0;nodej<elem_size;nodej++){
+							for(int coordj=0;coordj<n_coord;coordj++){
+								if(myTissue.dof_fwd_map_x[elem_ei[nodej]*n_coord+coordj]>-1){
+									T K_alpha_x_ni_njcj = {myTissue.dof_fwd_map_alpha[elem_ei[nodei]],myTissue.dof_fwd_map_x[elem_ei[nodej]*n_coord+coordj],Ke_alpha_x(nodei,nodej*n_coord+coordj)};
+									KK_triplets.push_back(K_alpha_x_ni_njcj);
+								}
+							}
+							if(myTissue.dof_fwd_map_rho[elem_ei[nodej]]>-1){
+								T K_alpha_rho_ni_nj = {myTissue.dof_fwd_map_alpha[elem_ei[nodei]],myTissue.dof_fwd_map_rho[elem_ei[nodej]],Ke_alpha_rho(nodei,nodej)};
+								KK_triplets.push_back(K_alpha_rho_ni_nj);
+							}
+							if(myTissue.dof_fwd_map_c[elem_ei[nodej]]>-1){
+								T K_alpha_c_ni_nj = {myTissue.dof_fwd_map_alpha[elem_ei[nodei]],myTissue.dof_fwd_map_c[elem_ei[nodej]],Ke_alpha_c(nodei,nodej)};
+								KK_triplets.push_back(K_alpha_c_ni_nj);
+							}
+							if(myTissue.dof_fwd_map_alpha[elem_ei[nodej]]>-1){
+								T K_alpha_alpha_ni_nj = {myTissue.dof_fwd_map_alpha[elem_ei[nodei]],myTissue.dof_fwd_map_alpha[elem_ei[nodej]],Ke_alpha_alpha(nodei,nodej)};
+								KK_triplets.push_back(K_alpha_alpha_ni_nj);
 							}
 						}
 					}
@@ -739,6 +827,36 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             }
             // FINISH LOOP OVER SURFACE ELEMENTS
             */
+            // Guard against NaN/Inf entering the linear solve. Without this the
+            // iterative solver just reports NoConvergence with a NaN error and
+            // the cause is invisible.
+            {
+                int bad_dof = -1;
+                for(int i=0;i<n_dof;i++){
+                    if(!std::isfinite(RR(i))){ bad_dof = i; break; }
+                }
+                long bad_k = 0;
+                for(size_t t=0;t<KK_triplets.size();t++)
+                    if(!std::isfinite(KK_triplets[t].value())) bad_k++;
+                if(bad_dof >= 0 || bad_k > 0){
+                    std::cout<<"*** NON-FINITE SYSTEM at step "<<step<<" iter "<<iter<<": ";
+                    if(bad_dof >= 0){
+                        std::vector<int> m = myTissue.dof_inv_map[bad_dof];
+                        const char* fld = (m[0]==0)?"x":((m[0]==1)?"rho":((m[0]==2)?"c":"alpha"));
+                        int nodei = (m[0]==0) ? m[1]/n_coord : m[1];
+                        std::cout<<"RR("<<bad_dof<<") field="<<fld<<" node="<<nodei
+                                 <<" X=("<<myTissue.node_X[nodei](0)<<","
+                                 <<myTissue.node_X[nodei](1)<<","
+                                 <<myTissue.node_X[nodei](2)<<")"
+                                 <<" rho="<<myTissue.node_rho[nodei]
+                                 <<" c="<<myTissue.node_c[nodei]<<"; ";
+                    }
+                    std::cout<<bad_k<<" non-finite tangent entries\n";
+                    reset = true;
+                    break;
+                }
+            }
+
             // residual norm
 			double normRR = sqrt(RR.dot(RR));
 			if(iter==0){
@@ -750,7 +868,61 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 				//std::cout<<"first tangents\nKe_c_x\n"<<Ke_c_x<<"\nKe_c_rho\n"<<Ke_c_rho<<"\nKe_c_c\n"<<Ke_c_c<<"\n";
 			}
 			else{residuum = normRR/(1+residuum0);}
-			
+
+            // RESIDUAL LOCALISATION
+            //
+            // Every claim about WHY Newton stalls has so far been inferred from
+            // aggregate norms. This names the dofs actually carrying the
+            // residual, so "the collapsing wound-rim elements are what kills the
+            // solve" becomes a measurement instead of a correlation: run_w15 has
+            // a one-element ring at 0.23-0.31 mm from the needle axis whose
+            // det(F^e) falls 0.218 -> 0.154 over 16 h. Either the worst dofs sit
+            // on those nodes or they do not.
+            //
+            // Gated on iter so it costs nothing on healthy steps (ordinary steps
+            // converge in 3-4 iterations). Overridable via WOUND_RESLOC.
+            {
+                static const int resloc_iter = [](){
+                    const char* e = std::getenv("WOUND_RESLOC");
+                    return e ? std::atoi(e) : 20;
+                }();
+                // Branch counts on EVERY iteration once we are past resloc_iter.
+                // The limit cycle has period 2, so a single snapshot cannot show
+                // it - the diagnostic value is entirely in whether a count
+                // ALTERNATES from one iteration to the next.
+                if(resloc_iter > 0 && iter >= resloc_iter && iter <= resloc_iter + 8){
+                    std::ostringstream tg; tg << "iter " << iter
+                                              << " R=" << residuum;
+                    reportBranchStats(tg.str().c_str());
+                }
+                if(resloc_iter > 0 && iter == resloc_iter){
+                    std::vector<int> idx(n_dof);
+                    for(int i=0;i<n_dof;i++) idx[i]=i;
+                    const int ntop = std::min(20, n_dof);
+                    std::partial_sort(idx.begin(), idx.begin()+ntop, idx.end(),
+                        [&](int a,int b){ return std::abs(RR(a)) > std::abs(RR(b)); });
+                    static const char* fname[4] = {"x","rho","c","alpha"};
+                    std::cout<<"\n  --- top "<<ntop<<" residual dofs at iter "<<iter
+                             <<" (|RR| total "<<normRR<<") ---\n";
+                    for(int k=0;k<ntop;k++){
+                        const int d = idx[k];
+                        const std::vector<int>& m = myTissue.dof_inv_map[d];
+                        const int nodei = (m[0]==0) ? m[1]/n_coord : m[1];
+                        const Vector3d& X = myTissue.node_x[nodei];
+                        // phif is an integration-point variable, not nodal, so
+                        // print coordinates: the collapsed ring is identifiable
+                        // offline as 0.23-0.31 mm from the needle axis (y=0,
+                        // z=5.49 deformed, x<0).
+                        std::cout<<"    |RR|="<<std::abs(RR(d))
+                                 <<"  field="<<fname[m[0]]
+                                 <<"  node="<<nodei
+                                 <<"  x=("<<X(0)<<","<<X(1)<<","<<X(2)<<")"
+                                 <<"  rwound="<<std::sqrt(X(1)*X(1)+(X(2)-5.49)*(X(2)-5.49))<<"\n";
+                    }
+                    std::cout<<"  ---------------------------------------------\n\n";
+                }
+            }
+
 			// SOLVE: one approach
 			//std::cout<<"solve\n";
 			//KK.setFromTriplets(KK_triplets.begin(), KK_triplets.end());
@@ -758,23 +930,182 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 			KK2.makeCompressed();
 			//std::cout<<"KK2\n"<<KK2<<"\n";
 
-			// Compute the numerical factorization
-            BICGsolver.compute(KK2);
-			if(BICGsolver.info()!=Eigen::Success) {
-                std::cout << "Factorization failed" << "\n";
-                reset = true;
-                break;
+            // ---------------- LINEAR SOLVE ----------------
+            //
+            // The monolithic system is badly SCALED, not merely stiff: the
+            // mechanics block carries entries of order kf ~ 40 MPa (and the
+            // fiber tangent pushes that to several hundred) while the transport
+            // blocks are of order 1/dt ~ 5. Unpreconditioned BiCGSTAB reported
+            // errors as large as 1e+74 on this, which surfaced as concentration
+            // increments of ~200 in a field whose physiological value is 1.
+            //
+            // Symmetric diagonal equilibration fixes the scaling: solve
+            //     (S K S) y = S b,    SOL = S y,    S = diag(1/sqrt(|K_ii|))
+            // which puts unit magnitude on the diagonal and makes the blocks
+            // comparable. A direct factorization is then used as the primary
+            // solver - at this problem size it is affordable and, unlike the
+            // iterative path, it does not silently return a garbage increment.
+            VectorXd Sscale(n_dof);
+            for(int i=0;i<n_dof;i++){
+                const double d = std::abs(KK2.coeff(i,i));
+                Sscale(i) = (d > 1e-300) ? 1.0/std::sqrt(d) : 1.0;
             }
+            {
+                // Apply S K S in place on the triplets, then rebuild.
+                for(size_t t=0;t<KK_triplets.size();t++){
+                    const int r = KK_triplets[t].row();
+                    const int cc = KK_triplets[t].col();
+                    KK_triplets[t] = T(r, cc, KK_triplets[t].value()*Sscale(r)*Sscale(cc));
+                }
+                KK2.setZero();
+                KK2.setFromTriplets(KK_triplets.begin(), KK_triplets.end());
+                KK2.makeCompressed();
+            }
+            VectorXd rhs_scaled(n_dof);
+            for(int i=0;i<n_dof;i++) rhs_scaled(i) = -RR(i)*Sscale(i);
 
-            // SOLVE: Use the factors to solve the linear system
-            SOL = BICGsolver.solve(-1.*RR);
-            //std::cout << "#iterations:     " << solver.iterations() << std::endl;
-            //std::cout << "estimated error: " << solver.error()      << std::endl;
-            //std::cout<<SOL<<"\n";
-            if(BICGsolver.info()!=Eigen::Success) {
+            // Iterative first, direct as fallback.
+            //
+            // Once the system is equilibrated the ILU-preconditioned iterative
+            // solve is reliable AND far cheaper: a direct factorization of the
+            // ~20k dof system costs ~1.4 min per Newton iteration here, which
+            // dominated the runtime. The reason the iterative path was demoted
+            // originally - BiCGSTAB returning a garbage increment while
+            // reporting success - is now caught three ways: equilibration fixes
+            // the conditioning that caused it, the increment is checked for
+            // finiteness below, and a step that fails to converge is rejected
+            // rather than accepted.
+            // info() == Success is NOT sufficient. BiCGSTAB can converge to
+            // y ~ 0 and report success when the ILU preconditioner breaks down:
+            // observed returning an increment of 6e-10 against a residual of
+            // 1e-3, so Newton had nothing to move with. It burned 200 iterations
+            // per step, every step was rejected, dt collapsed, and the run
+            // aborted with "Solver failed too many times". None of the three
+            // guards caught it - equilibration does not fix a broken
+            // preconditioner, 6e-10 is finite, and rejecting the step just
+            // repeated the same solve on a smaller dt.
+            //
+            // So verify the increment actually solves the system. One sparse
+            // matvec per iteration, against a direct factorization that costs
+            // ~1.4 min when it fires.
+            const double lin_tol = 1e-6;
+            auto lin_rel_resid = [&](const VectorXd &y){
+                const double bn = rhs_scaled.norm();
+                const double rn = (KK2*y - rhs_scaled).norm();
+                return (bn > 1e-300) ? rn/bn : rn;
+            };
+
+            bool solved = false;
+            {
+                BICGsolver.compute(KK2);
+                if(BICGsolver.info()==Eigen::Success){
+                    VectorXd y = BICGsolver.solve(rhs_scaled);
+                    const double rel = lin_rel_resid(y);
+                    if(BICGsolver.info()==Eigen::Success && rel < lin_tol){
+                        for(int i=0;i<n_dof;i++) SOL(i) = y(i)*Sscale(i);
+                        solved = true;
+                    }else{
+                        std::cout<<"  iterative solve rejected (relative residual "
+                                 <<rel<<", info "<<(BICGsolver.info()==Eigen::Success?"ok":"fail")
+                                 <<") - falling back to a direct factorization\n";
+                    }
+                }
+            }
+            if(!solved){
+                // Iterative solve stagnated: fall back to a direct
+                // factorization for this iteration.
+                SparseMatrix<double, ColMajor> KKcol = KK2;
+                KKcol.makeCompressed();
+                SparseLUsolver.analyzePattern(KKcol);
+                SparseLUsolver.factorize(KKcol);
+                if(SparseLUsolver.info()==Eigen::Success){
+                    VectorXd y = SparseLUsolver.solve(rhs_scaled);
+                    const double rel = lin_rel_resid(y);
+                    if(SparseLUsolver.info()==Eigen::Success && rel < 1e-4){
+                        for(int i=0;i<n_dof;i++) SOL(i) = y(i)*Sscale(i);
+                        solved = true;
+                    }else{
+                        std::cout<<"  direct solve also failed (relative residual "
+                                 <<rel<<")\n";
+                    }
+                }
+            }
+            if(!solved){
                 std::cout << "Solver failed, no convergence" << "\n";
                 reset = true;
                 break;
+            }
+            for(int i=0;i<n_dof;i++){
+                if(!std::isfinite(SOL(i))){
+                    std::cout << "Solver returned a non-finite increment" << "\n";
+                    reset = true; solved = false; break;
+                }
+            }
+            if(!solved) break;
+
+            // DAMPED NEWTON / STEP LIMITING
+            //
+            // Seeding a wound collapses the passive stress in the wound elements
+            // (SSe_pas scales with phif, which drops from 1 to 0.01), so the
+            // punctured prestretched shell snaps open. That is a violently
+            // nonlinear event and an undamped Newton step overshoots badly:
+            // increments were observed running 5.6 -> 25 -> 118 before the
+            // tangent went non-finite. Scaling the whole increment preserves the
+            // Newton direction and just limits how far we travel per iteration.
+            {
+                double max_dx = 0.0, max_dfield = 0.0;
+                for(int dofi=0;dofi<n_dof;dofi++){
+                    const std::vector<int>& m = myTissue.dof_inv_map[dofi];
+                    const double a = std::abs(SOL(dofi));
+                    if(m[0]==0) max_dx     = std::max(max_dx, a);
+                    else        max_dfield = std::max(max_dfield, a);
+                }
+                // limits per Newton iteration
+                const double dx_cap    = 0.05;  // [mm]
+                const double dfld_cap  = 0.25;  // normalized concentration
+
+                // WOUND_LINESEARCH=1 scales the mechanics and transport blocks
+                // INDEPENDENTLY instead of taking the min over both and applying
+                // it to the whole vector.
+                //
+                // The coupled form throttles everything to the worst offender in
+                // either block. At the run_w15 failure the log reads
+                //   max dx 0.0130 (cap 0.05 - no damping needed at all)
+                //   max dfield 8.55
+                // so one transport dof forced scale = 0.25/8.55 = 0.029 onto the
+                // MECHANICS increment too. Newton then made ~3% progress per
+                // iteration and burned 57 iterations before the step was rejected.
+                //
+                // Uniform scaling preserves the Newton direction exactly and
+                // per-block scaling does not, which is why the coupled form was
+                // written this way. But a direction held at 3% of its length is
+                // not making progress either, so this is an A/B, not a claim.
+                static const int decouple = [](){
+                    const char* e = std::getenv("WOUND_LINESEARCH");
+                    return e ? std::atoi(e) : 0;
+                }();
+
+                if(decouple){
+                    double sx = 1.0, sf = 1.0;
+                    if(max_dx     > dx_cap)   sx = dx_cap/max_dx;
+                    if(max_dfield > dfld_cap) sf = dfld_cap/max_dfield;
+                    if(sx < 1.0 || sf < 1.0){
+                        for(int dofi=0;dofi<n_dof;dofi++)
+                            SOL(dofi) *= (myTissue.dof_inv_map[dofi][0]==0) ? sx : sf;
+                        std::cout<<"  damping Newton step (decoupled) x by "<<sx
+                                 <<", fields by "<<sf
+                                 <<" (max dx "<<max_dx<<", max dfield "<<max_dfield<<")\n";
+                    }
+                }else{
+                    double scale = 1.0;
+                    if(max_dx     > dx_cap)   scale = std::min(scale, dx_cap/max_dx);
+                    if(max_dfield > dfld_cap) scale = std::min(scale, dfld_cap/max_dfield);
+                    if(scale < 1.0){
+                        SOL *= scale;
+                        std::cout<<"  damping Newton step by "<<scale
+                                 <<" (max dx "<<max_dx<<", max dfield "<<max_dfield<<")\n";
+                    }
+                }
             }
 
 			// update the solution
@@ -794,13 +1125,61 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 				}else if(dof_inv_i[0]==2){
 					// C dof
 					myTissue.node_c[dof_inv_i[1]] += SOL(dofi);
+				}else if(dof_inv_i[0]==3){
+					// alpha dof (pro-inflammatory signal)
+					myTissue.node_alpha[dof_inv_i[1]] += SOL(dofi);
 				}
 			}
 			iter += 1;
 
+            // SECOND CONVERGENCE TEST: has the state stopped moving?
+            //
+            // The residual test alone cannot see a Newton limit cycle. The
+            // plastic-growth deadband in the local solver switches on a hard
+            // threshold, so lamdaP_dot is continuous but its slope jumps at the
+            // band edge: the residual is C0, not C1. An integration point
+            // sitting on that kink makes Newton chatter across it - observed
+            // repeating residual 9.85137e-06 and increment 9.27092e-06
+            // bit-for-bit from iteration 10 to 200, alternating between two
+            // states. Halving dt does not help, because the cycle is a property
+            // of the state at the kink, not of the step size.
+            //
+            // When the increment has collapsed the step is converged for every
+            // practical purpose, so accept it. The residual guard keeps this
+            // from rescuing a genuinely diverged step: the unconverged steps
+            // that once produced concentrations of -1.66 carried increments of
+            // ~124, seven orders above tol_inc.
+            // Gated on the iteration count so this stays an ESCAPE HATCH and
+            // does not become the primary convergence test. The residual is
+            // checked at the top of the loop and this test at the bottom, so
+            // ungated it preempts the residual: it fired on 225 of 225 steps,
+            // at iteration 2-3, accepting a median residual of 8.6e-6 against a
+            // tol of 1e-6. Only 3 of those were real limit cycles. Ordinary
+            // steps converge in 3-4 iterations, so iteration 10 is unambiguous
+            // stagnation, and a true stall escapes here instead of burning 200
+            // iterations and then being rejected.
+            const int min_iter_stagnation = 10;
+            if(iter >= min_iter_stagnation
+               && normSOL <= myTissue.tol_inc && residuum <= 1.0e3*myTissue.tol){
+                std::cout<<"\nincrement collapsed to "<<normSOL<<" (<= "
+                         <<myTissue.tol_inc<<") with residual "<<residuum
+                         <<" - state has stopped moving, accepting the step\n";
+                std::cout<<"End of iteration : "<<iter<<",\nResidual before increment: "<<residuum
+                         <<",\nNorm of residual before increment: "<<normRR
+                         <<"\nIncrement norm: "<<normSOL<<"\n\n";
+                break;
+            }
+
             // ADAPTIVE TIME STEP FOR NON-CONVERGED ITERATIONS
-			if(iter == myTissue.max_iter){
-			    std::cout<<"\nCheck, make sure residual is small enough\n";
+			if(iter == myTissue.max_iter && residuum > myTissue.tol){
+			    // Do NOT accept an unconverged step. Rejecting it here and
+			    // halving dt below is what makes the puncture snap-open
+			    // resolvable: accepting it produced concentrations as low as
+			    // -1.66 (the transport equations have no positivity limiter,
+			    // so an unconverged increment shows up as negative species).
+			    std::cout<<"\nmax_iter reached with residual "<<residuum
+			             <<" > tol "<<myTissue.tol<<" - rejecting the step\n";
+			    reset = true;
 			    // Slow down but keep going forward
                 /*std::cout << "Decreasing time step" << "\n";
                 if(slow_iter == 0){
@@ -835,7 +1214,7 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
                 slow_iter = slow_iter*slowdown;
                 total_slowdown = total_slowdown*slowdown;
 
-                if(total_slowdown > pow(slowdown,3)){
+                if(total_slowdown > pow(slowdown,6)){
                     throw std::runtime_error("Solver failed too many times!");
                     break;
                 }
@@ -846,11 +1225,14 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
             step = step*slowdown;
             total_steps = total_steps*slowdown;
 
-            // reset nodal variables
+            // reset nodal variables (including the geometry - see the snapshot
+            // taken at the top of this time step)
+            myTissue.node_x = node_x_step;
             for(int nodei=0;nodei<myTissue.n_node;nodei++)
             {
                 myTissue.node_rho[nodei] = myTissue.node_rho_0[nodei];
                 myTissue.node_c[nodei] = myTissue.node_c_0[nodei] ;
+                myTissue.node_alpha[nodei] = myTissue.node_alpha_0[nodei];
             }
             // reset integration point variables
             for(int elemi=0;elemi<myTissue.n_vol_elem;elemi++)
@@ -869,6 +1251,32 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
         }
 
         // ADVANCE IN TIME
+        // POSITIVITY REPORT
+        //
+        // The transport discretization does not guarantee positivity, and there
+        // is deliberately no clamping: clamping would hide a convergence
+        // problem rather than fix one. Report instead, so a negative species
+        // can never pass unnoticed. Rejecting unconverged steps removes the
+        // usual cause; anything surviving that is a genuine discretization
+        // artefact worth seeing.
+        {
+            int n_neg = 0; double worst = 0.0; const char* which = "";
+            const bool has_a = !myTissue.node_alpha.empty();
+            for(int i=0;i<myTissue.n_node;i++){
+                const double r = myTissue.node_rho[i];
+                const double cc = myTissue.node_c[i];
+                const double aa = has_a ? myTissue.node_alpha[i] : 0.0;
+                if(r  < worst){ worst = r;  which = "rho"; }
+                if(cc < worst){ worst = cc; which = "c"; }
+                if(aa < worst){ worst = aa; which = "alpha"; }
+                // Threshold, not < 0: alpha_h is exactly 0, so round-off makes
+                // half the mesh look "negative" and hides the real magnitude.
+                if(r < -1e-8 || cc < -1e-8 || aa < -1e-8) n_neg++;
+            }
+            if(n_neg > 0)
+                std::cout<<"  NEGATIVE SPECIES at step "<<step<<": "<<n_neg
+                         <<" node(s), worst "<<which<<" = "<<worst<<"\n";
+        }
 
         // Increment in time before ending adaptive step
         time += time_step;
@@ -893,6 +1301,7 @@ void sparseWoundSolver(tissue &myTissue, const std::string& filename, int save_f
 		{
 			myTissue.node_rho_0[nodei] = myTissue.node_rho[nodei];
 			myTissue.node_c_0[nodei] = myTissue.node_c[nodei] ;
+			myTissue.node_alpha_0[nodei] = myTissue.node_alpha[nodei];
 		}
 		// integration point variables
 #pragma omp parallel for
@@ -988,9 +1397,19 @@ void sparseLoadSolver(tissue &myTissue, const std::string& filename, int save_fr
     //SparseMatrix<double> KK2(n_dof,n_dof);
     //SparseMatrix<double,ColMajor> KK2(n_dof,n_dof); // ColMajor for SparseLU
 
-    BiCGSTAB<SparseMatrix<double, RowMajor> > BICGsolver; // Try with or without preconditioner , Eigen::IncompleteLUT<double>
-    //PardisoLU<SparseMatrix<double>> pardisoLUsolver;
-    //SparseLU<SparseMatrix<double, ColMajor>, COLAMDOrdering<int> > SparseLUsolver;
+    // Seeding a wound drops phif from 1 to 0.01, and the passive stress scales
+    // with phif, so the tangent picks up a ~100x stiffness contrast on top of
+    // the mechanics/transport block scaling. Unpreconditioned BiCGSTAB
+    // stagnates on that and reports NoConvergence. An incomplete-LU
+    // preconditioner handles it; a direct SparseLU is kept as a fallback for
+    // the rare step where the iterative solve still fails, which is much
+    // cheaper than the alternative of repeatedly halving the time step.
+    BiCGSTAB<SparseMatrix<double, RowMajor>, IncompleteLUT<double> > BICGsolver;
+    BICGsolver.preconditioner().setDroptol(1e-5);
+    BICGsolver.preconditioner().setFillfactor(20);
+    BICGsolver.setMaxIterations(2000);
+    BICGsolver.setTolerance(1e-10);
+    SparseLU<SparseMatrix<double, ColMajor>, COLAMDOrdering<int> > SparseLUsolver;
 
     //std::cout<<"start parameters\n";
     // PARAMETERS FOR THE SIMULATION
@@ -1032,6 +1451,9 @@ void sparseLoadSolver(tissue &myTissue, const std::string& filename, int save_fr
             KK2.setZero();
             RR.setZero();
             KK_triplets.clear();
+            // Branch instrumentation: reset before the element loop so the counts
+            // reported below describe exactly this Newton iteration.
+            resetBranchStats();
             SOL.setZero();
 
             // START LOOP OVER ELEMENTS

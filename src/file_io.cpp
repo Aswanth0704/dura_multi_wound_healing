@@ -561,8 +561,15 @@ void writeTissue(tissue &myTissue, const char* filename,double time)
 	savefile<<myTissue.n_vol_elem<<"\n";
 	savefile<<myTissue.n_IP<<"\n";
 	savefile<<myTissue.n_dof<<"\n";
+	// Write however many nodes the element actually has. This used to be
+	// hard-coded to 8, which read past the end of 4-node tet connectivity and
+	// emitted uninitialized memory (differing between runs of the same binary).
 	for(int i=0;i<myTissue.vol_elem_connectivity.size();i++){
-		savefile<<myTissue.vol_elem_connectivity[i][0]<<" "<<myTissue.vol_elem_connectivity[i][1]<<" "<<myTissue.vol_elem_connectivity[i][2]<<" "<<myTissue.vol_elem_connectivity[i][3]<<" "<<myTissue.vol_elem_connectivity[i][4]<<" "<<myTissue.vol_elem_connectivity[i][5]<<" "<<myTissue.vol_elem_connectivity[i][6]<<" "<<myTissue.vol_elem_connectivity[i][7]<<"\n";
+		for(int j=0;j<myTissue.vol_elem_connectivity[i].size();j++){
+			savefile<<myTissue.vol_elem_connectivity[i][j];
+			if(j+1<myTissue.vol_elem_connectivity[i].size()) savefile<<" ";
+		}
+		savefile<<"\n";
 	}
 	for(int i=0;i<myTissue.boundaryNodes.size();i++){
 		savefile<<myTissue.boundaryNodes[i]<<"\n";
@@ -576,6 +583,9 @@ void writeTissue(tissue &myTissue, const char* filename,double time)
 	for(int i=0;i<myTissue.node_c_0.size();i++){
 		savefile<<myTissue.node_c_0[i]<<"\n";
 	}
+	for(int i=0;i<myTissue.node_alpha_0.size();i++){
+		savefile<<myTissue.node_alpha_0[i]<<"\n";
+	}
 	for(int i=0;i<myTissue.ip_phif_0.size();i++){
 		savefile<<myTissue.ip_phif_0[i]<<"\n";
 	}
@@ -585,8 +595,9 @@ void writeTissue(tissue &myTissue, const char* filename,double time)
 	for(int i=0;i<myTissue.ip_kappa_0.size();i++){
 		savefile<<myTissue.ip_kappa_0[i]<<"\n";
 	}	
+	// All three components (this used to drop the through-thickness one).
 	for(int i=0;i<myTissue.ip_lamdaP_0.size();i++){
-		savefile<<myTissue.ip_lamdaP_0[i](0)<<" "<<myTissue.ip_lamdaP_0[i](1)<<"\n";
+		savefile<<myTissue.ip_lamdaP_0[i](0)<<" "<<myTissue.ip_lamdaP_0[i](1)<<" "<<myTissue.ip_lamdaP_0[i](2)<<"\n";
 	}
 	for(int i=0;i<myTissue.node_x.size();i++){
 		savefile<<myTissue.node_x[i](0)<<" "<<myTissue.node_x[i](1)<<" "<<myTissue.node_x[i](2)<<"\n";
@@ -1258,7 +1269,8 @@ void writeParaview(tissue &myTissue, const char* filename, const char* filename2
                 node_ip_count[myTissue.vol_elem_connectivity[elemi][ip]] += 1;
             }
             else if(elem_size == 4){
-                // There is only one IP, so just average the element
+                // Average all IPs of the element onto each of its nodes
+                // (node_ip_count is incremented to match).
                 for(int nodei=0;nodei<elem_size;nodei++){
                     node_phi[myTissue.vol_elem_connectivity[elemi][nodei]]+=myTissue.ip_phif[elemi*IP_size+ip];
                     node_a0[myTissue.vol_elem_connectivity[elemi][nodei]]+=myTissue.ip_a0[elemi*IP_size+ip];
@@ -1305,6 +1317,17 @@ void writeParaview(tissue &myTissue, const char* filename, const char* filename2
         savefile2<<  node_lamdaP[i](0)*node_lamdaP[i](1)*node_lamdaP[i](2) << " " << node_lamdaP[i](0)<<" "<<node_lamdaP[i](1)<<" "<<node_lamdaP[i](2) << "\n";
 	}
 	// write out the fiber direction
+	// Append alpha as its OWN attribute block. The packed SCALARS above is
+	// already at 4 components, which is the legacy-VTK maximum, so it cannot be
+	// widened; legacy VTK does allow several attribute blocks inside one
+	// POINT_DATA section, and a second POINT_DATA line must NOT be emitted.
+	if(myTissue.node_alpha.size() == (size_t)myTissue.n_node){
+		savefile<<"\nSCALARS alpha float 1\nLOOKUP_TABLE default\n";
+		for(int i=0;i<myTissue.n_node;i++){
+			savefile<<myTissue.node_alpha[i]<<"\n";
+		}
+	}
+
 	savefile<<"\nVECTORS a0 float\n";
     savefile2<<"\nVECTORS lamdaE float\n";
 	for(int i=0;i<myTissue.n_node;i++){

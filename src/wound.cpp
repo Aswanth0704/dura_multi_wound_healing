@@ -11,14 +11,90 @@ This code is the implementation of the DaLaWoHe
 #include "wound.h"
 #include "local_solver.h"
 #include "element_functions.h"
+#include "mechanosensing.h"
+#include "diffusivity.h"
 #include <iostream>
 #include <cmath>
 #include <map>
 #include <Eigen/OrderingMethods>
 #include <Eigen/Eigenvalues>
 #include <fstream>
+#include <cstdlib>
 
 using namespace Eigen;
+
+//--------------------------------------------------------//
+// VOLUMETRIC PENALTY SCALING  (WOUND_VOLPHI, default 1 = legacy)
+//--------------------------------------------------------//
+//
+// The volumetric energy is
+//
+//     Psi_vol(Je) = (phi*p/2)(Je-1)^2 - 2*phi*k0*ln(Je)
+//
+// The log term is the ONLY barrier preventing element inversion, and in the
+// legacy form it carries phif. Balancing it against a confining pressure P
+// gives Je ~ 2*phi*k0/P, i.e. the equilibrium elastic volume is PROPORTIONAL
+// to collagen fraction - the barrier is weakest exactly where it is needed
+// most. Measured in run_w15: a one-element ring on the wound rim collapses from
+// det(F^e) = 0.218 to 0.154 over 16 h, count below 0.25 doubling every 4 h,
+// while the far field holds 0.99739 exactly. corr(phif, det F^e) = 0.86.
+//
+// Physically the legacy scaling is backwards. Soft tissue is near-incompressible
+// because it is ~75% WATER, not because of collagen; a wound fills with blood,
+// fibrin and granulation tissue, all ~90% water, so the BULK modulus barely
+// changes while shear and fiber stiffness genuinely do collapse. Only the pure
+// penalty term is mis-scaled.
+//
+// At WOUND_VOLPHI=0 the penalty becomes collagen-independent. The -2*phi*k0/Je
+// term KEEPS its phif: it is paired with the phif*k0*Identity in SSe_pas and the
+// two cancel at Ce = I (where E = 0 so Psif1 = Psif4 = 0), which is what makes
+// the reference state stress-free for every phi. Unscaling k0 there without
+// unscaling it here would leave (phi-1)*k0*I ~ -0.019 MPa of spurious pressure
+// in the wound. Exact no-op at phif = 1, so homeostasis is untouched.
+static inline double volPenaltyScale(double phif)
+{
+    static const int legacy = [](){
+        const char* e = std::getenv("WOUND_VOLPHI");
+        return e ? std::atoi(e) : 1;
+    }();
+    return legacy ? phif : 1.0;
+}
+
+//--------------------------------------------------------//
+// MECHANICAL COLLAGEN FLOOR  (WOUND_PHIFLOOR, default 0 = off)
+//--------------------------------------------------------//
+//
+// Removes the DRIVER of the growth runaway rather than its amplifier.
+//
+// With phif -> 0.01 the wound retains ~0.2 Pa of shear stiffness, so the soft
+// inclusion is stretched in-plane by the prestretched surround (theta_e -> 2.05)
+// and thinned to lamda_n = 0.168 - three times past what incompressibility
+// permits (1/2.05 = 0.49). That puts lamdaE_n ~ 0.17, five times below the
+// growth deadband floor of 0.85, which is what drives lamdaP (and hence Jp, and
+// hence the element's entire stress response) toward zero.
+//
+// Flooring the collagen fraction seen by the PASSIVE stress keeps a physically
+// real residual stiffness: at phif_floor = 0.05 the wound holds ~1 kPa in shear,
+// the right order for granulation tissue, which is fibrin and cells rather than
+// a void.
+//
+// Applies to the GROUND-SUBSTANCE (k0) terms only, and to BOTH of them: the
+// phif*k0*Identity in SSe_pas and the -2*phif*k0/Je in the volumetric part are
+// one neo-Hookean material and must be floored together, or the element carries
+// (phif_floor - phif)*k0*I of spurious pressure at zero strain. Floored together
+// they still cancel exactly at Ce = I, where E = 0 so the fibre terms vanish.
+//
+// The FIBRE terms (Psif1, Psif4) keep the true unfloored phif - no collagen
+// means no fibre load, which is correct and is what lets the wound stay soft in
+// shear and still contract.
+static inline double phifMech(double phif)
+{
+    static const double floor_v = [](){
+        const char* e = std::getenv("WOUND_PHIFLOOR");
+        return e ? std::atof(e) : 0.0;
+    }();
+    return (phif > floor_v) ? phif : floor_v;
+}
 
 //--------------------------------------------------------//
 // RESIDUAL AND TANGENT
@@ -29,17 +105,18 @@ void evalWound(
         double dt, double time, double time_final,
         const std::vector<Matrix3d> &ip_Jac,
         const std::vector<double> &global_parameters,const std::vector<double> &local_parameters,
-        std::vector<Matrix3d> &ip_strain,std::vector<Matrix3d> &ip_stress, const std::vector<double> &node_rho_0, const std::vector<double> &node_c_0, //
+        std::vector<Matrix3d> &ip_strain,std::vector<Matrix3d> &ip_stress, const std::vector<double> &node_rho_0, const std::vector<double> &node_c_0, const std::vector<double> &node_alpha_0, //
         const std::vector<double> &ip_phif_0,const std::vector<Vector3d> &ip_a0_0,const std::vector<Vector3d> &ip_s0_0,const std::vector<Vector3d> &ip_n0_0,const std::vector<double> &ip_kappa_0, const std::vector<Vector3d> &ip_lamdaP_0, //
-        const std::vector<double> &node_rho, const std::vector<double> &node_c,
+        const std::vector<double> &node_rho, const std::vector<double> &node_c, const std::vector<double> &node_alpha,
         std::vector<double> &ip_phif, std::vector<Vector3d> &ip_a0, std::vector<Vector3d> &ip_s0, std::vector<Vector3d> &ip_n0, std::vector<double> &ip_kappa, std::vector<Vector3d> &ip_lamdaP, //
         std::vector<Vector3d> &ip_lamdaE,
         const std::vector<Vector3d> &node_x,
         const std::vector<Vector3d> &node_X,
         std::vector<Vector3d> &ip_dphifdu, std::vector<double> &ip_dphifdrho, std::vector<double> &ip_dphifdc,
-        VectorXd &Re_x,MatrixXd &Ke_x_x,MatrixXd &Ke_x_rho,MatrixXd &Ke_x_c,
-        VectorXd &Re_rho,MatrixXd &Ke_rho_x, MatrixXd &Ke_rho_rho,MatrixXd &Ke_rho_c,
-        VectorXd &Re_c,MatrixXd &Ke_c_x,MatrixXd &Ke_c_rho,MatrixXd &Ke_c_c)
+        VectorXd &Re_x,MatrixXd &Ke_x_x,MatrixXd &Ke_x_rho,MatrixXd &Ke_x_c,MatrixXd &Ke_x_alpha,
+        VectorXd &Re_rho,MatrixXd &Ke_rho_x, MatrixXd &Ke_rho_rho,MatrixXd &Ke_rho_c,MatrixXd &Ke_rho_alpha,
+        VectorXd &Re_c,MatrixXd &Ke_c_x,MatrixXd &Ke_c_rho,MatrixXd &Ke_c_c,MatrixXd &Ke_c_alpha,
+        VectorXd &Re_alpha,MatrixXd &Ke_alpha_x,MatrixXd &Ke_alpha_rho,MatrixXd &Ke_alpha_c,MatrixXd &Ke_alpha_alpha)
 {
 
     //std::cout<<"element routine\n";
@@ -96,6 +173,11 @@ void evalWound(
     double bx = global_parameters[22]; // body force
     double by = global_parameters[23]; // body force
     double bz = global_parameters[24]; // body force
+    // alpha (pro-inflammatory signal). APPENDED at the end so that every
+    // existing literal index into global_parameters stays valid.
+    double D_alpha   = (global_parameters.size()>25) ? global_parameters[25] : 0.0;
+    double d_alpha   = (global_parameters.size()>26) ? global_parameters[26] : 0.0;
+    double p_c_alpha = (global_parameters.size()>27) ? global_parameters[27] : 0.0;
     //std::cout<<"read all global parameters\n";
     //
     //---------------------------------//
@@ -108,6 +190,9 @@ void evalWound(
     Re_x.setZero(); Ke_x_x.setZero(); Ke_x_rho.setZero(); Ke_x_c.setZero();
     Re_rho.setZero(); Ke_rho_x.setZero(); Ke_rho_rho.setZero(); Ke_rho_c.setZero();
     Re_c.setZero(); Ke_c_x.setZero(); Ke_c_rho.setZero(); Ke_c_c.setZero();
+    Ke_x_alpha.setZero(); Ke_rho_alpha.setZero(); Ke_c_alpha.setZero();
+    Re_alpha.setZero(); Ke_alpha_x.setZero(); Ke_alpha_rho.setZero();
+    Ke_alpha_c.setZero(); Ke_alpha_alpha.setZero();
     int elem_size = node_x.size();
     std::vector<Vector3d> Ebasis; Ebasis.clear();
     Ebasis.push_back(Vector3d(1.,0.,0.)); Ebasis.push_back(Vector3d(0.,1.,0.)); Ebasis.push_back(Vector3d(0.,0.,1.));
@@ -139,8 +224,13 @@ void evalWound(
         IP = LineQuadriIPTetQuadratic();
     }
     int IP_size = IP.size();
-    // we are going to interpolate the position
-    Vector3d X; X.setZero();
+    // Interpolated reference position of the current integration point.
+    // NOTE: this used to be declared (and zeroed) OUTSIDE the loop while being
+    // accumulated inside it, so it summed the positions of every IP visited so
+    // far - by the 4th tet IP it read ~4x a real coordinate. Nothing consumed it
+    // (localWoundProblemExplicit takes X but never uses it), so there was no
+    // physical effect, but it made any per-IP position reporting nonsense.
+    Vector3d X;
     //std::cout<<"loop over integration points\n";
     for(int ip=0;ip<IP_size;ip++)
     {
@@ -203,6 +293,9 @@ void evalWound(
         double rho=0.; Vector3d drhodXi; drhodXi.setZero();
         double c_0=0.; Vector3d dc0dXi; dc0dXi.setZero();
         double c=0.; Vector3d dcdXi; dcdXi.setZero();
+        double alpha_0=0.; Vector3d dalpha0dXi; dalpha0dXi.setZero();
+        double alpha=0.;   Vector3d dalphadXi;  dalphadXi.setZero();
+        X.setZero();   // per-IP, not accumulated across the element
         //
         for(int ni=0;ni<elem_size;ni++)
         {
@@ -234,6 +327,16 @@ void evalWound(
             dcdXi(0) += node_c[ni]*Rxi[ni];
             dcdXi(1) += node_c[ni]*Reta[ni];
             dcdXi(2) += node_c[ni]*Rzeta[ni];
+
+            alpha_0 += node_alpha_0[ni]*R[ni];
+            dalpha0dXi(0) += node_alpha_0[ni]*Rxi[ni];
+            dalpha0dXi(1) += node_alpha_0[ni]*Reta[ni];
+            dalpha0dXi(2) += node_alpha_0[ni]*Rzeta[ni];
+
+            alpha += node_alpha[ni]*R[ni];
+            dalphadXi(0) += node_alpha[ni]*Rxi[ni];
+            dalphadXi(1) += node_alpha[ni]*Reta[ni];
+            dalphadXi(2) += node_alpha[ni]*Rzeta[ni];
         }
         //
         //---------------------------------//
@@ -267,6 +370,8 @@ void evalWound(
         Vector3d Grad_rho = ip_Jac[ip]*drhodXi;
         Vector3d Grad_c0 = ip_Jac[ip]*dc0dXi;
         Vector3d Grad_c = ip_Jac[ip]*dcdXi;
+        Vector3d Grad_alpha0 = ip_Jac[ip]*dalpha0dXi;
+        Vector3d Grad_alpha  = ip_Jac[ip]*dalphadXi;
         //
         // Gradient of basis functions for the nodes in reference
         std::vector<Vector3d> Grad_R;Grad_R.clear();
@@ -443,7 +548,7 @@ void evalWound(
         double dkappadc  = dThetadc(4);
         double dlamdaP_adc  = dThetadc(5);
         double dlamdaP_sdc  = dThetadc(6);
-        double dlamdaP_ndc  = dThetadrho(7);
+        double dlamdaP_ndc  = dThetadc(7);   // was dThetadrho(7): copy-paste slip
         //---------------------------------//
         //std::cout<<"SOLVE.\ndThetadCC\n"<<dThetadCC<<"\ndThetadrho\n"<<dThetadrho<<"\ndThetadc\n"<<dThetadc<<"\n";
 
@@ -512,7 +617,10 @@ void evalWound(
         double Psif1 = 2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
         double Psif4 = 2*k2*(1-3*kappa)*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
         //Matrix3d SSe_pas = k0*Identity + phif*(Psif1*Identity + Psif4*a0a0);
-        Matrix3d SSe_pas = phif*(k0*Identity + Psif1*Identity + Psif4*a0a0);
+        // Ground substance uses the FLOORED collagen fraction (phifMech, a no-op
+        // unless WOUND_PHIFLOOR is set); fibres keep the true phif.
+        Matrix3d SSe_pas = phifMech(phif)*k0*Identity
+                         + phif*(Psif1*Identity + Psif4*a0a0);
         // pull back to the reference,
         Matrix3d SS_pas = Jp*FFginv*SSe_pas*FFginv;
 
@@ -532,17 +640,9 @@ void evalWound(
         // SSvol = 2dPsivol/dCC = 2dPsivol/dJe * dJe/dCC
         double penalty = 0.3166667;
         double Psivol = 0.5*phif*pow(penalty*(Je-1.),2) - 2*phif*k0*log(Je); //*phif
-        double dPsivoldJe = phif*penalty*(Je-1.) - 2*phif*k0/Je;
-        double dPsivoldJedJe = phif*penalty + 2*phif*k0/(Je*Je);
-	double eq_const = 1582.3;
-	double eq_a = 182.01;
-	double eq_b = -655;
-	double eq_c = 875.66;
-	double eq_d = -521.57;
-	double eq_e = 118.9;
-    double phif00 = 1e-2;
-    double D_rhorho = eq_const*((pow((((eq_a*pow(phif-phif00,5)) + (eq_b*pow(phif-phif00,4)) + (eq_c*pow(phif-phif00,3)) + (eq_d*pow(phif-phif00,2)) + (eq_e*(phif-phif00)))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1)))));
-	// double D_rhorho = eq_const*((pow((((eq_a*pow(phif,5)) + (eq_b*pow(phif,4)) + (eq_c*pow(phif,3)) + (eq_d*pow(phif,2)) + (eq_e*phif))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1))))) + 6.12E-5 + (0.00612*(c/(1E-5+c)));
+        double dPsivoldJe = volPenaltyScale(phif)*penalty*(Je-1.) - 2*phifMech(phif)*k0/Je;
+        double dPsivoldJedJe = volPenaltyScale(phif)*penalty + 2*phifMech(phif)*k0/(Je*Je);
+    double D_rhorho = evalDrho(phif, c);
         Matrix3d SSe_vol = dPsivoldJe*Je*CCeinv/2; // = phif*penalty*Je*(Je-1.)*CCeinv/2 - phif*k0*CCeinv;
         Matrix3d SS_vol = Jp*FFginv*SSe_vol*FFginv;
 
@@ -571,12 +671,30 @@ void evalWound(
         //------------------//
         // SOURCE
         //------------------//
-        double He = 1./(1.+exp(-gamma_theta*(Je - vartheta_e)));
+        // Mechanosensing stimulus: in-plane AREAL elastic stretch of the dural
+        // mid-surface, theta_e = ||cof(F^e).n0||, NOT det(F^e). The tissue is
+        // treated as incompressible so det(F^e)==1 and could never respond to
+        // membrane stretch. See include/mechanosensing.h.
+        double theta_e = evalThetaE(J, CCinv, n0, lamdaP_a, lamdaP_s);
+        double He = evalHe(theta_e, vartheta_e, gamma_theta);
 
         // function for elastic response of the cells
         double S_rho = (p_rho + p_rho_c*c/(K_rho_c+c) + p_rho_theta*He)*(1-rho/K_rho_rho)*rho - d_rho*rho;
         // function for elastic response of the chemical
-        double S_c = (p_c_rho*c+ p_c_thetaE*He)*(rho/(K_c_c+c)) - d_c*c;
+        // Cytokine source gains the pro-inflammatory drive p_c_alpha*alpha.
+        // At homeostasis alpha_h = 0 so this term vanishes and the derived
+        // p_c_rho still makes (0,1,1,1) an exact fixed point.
+        double S_c = (p_c_rho*c+ p_c_thetaE*He)*(rho/(K_c_c+c)) - d_c*c + p_c_alpha*alpha;
+
+        //------------------//
+        // ALPHA: pro-inflammatory signal
+        //   alpha_dot + div(Q_alpha) = s_alpha,  Q_alpha = -D_alpha grad(alpha),
+        //   s_alpha = -d_alpha alpha
+        // No dependence on phif, a0, kappa or lamdaP, so this needs no new
+        // structural sensitivities.
+        //------------------//
+        Vector3d Q_alpha = -D_alpha*CCinv*Grad_alpha;
+        double S_alpha = -d_alpha*alpha;
         //std::cout<<"SS_voigt\n"<<SS_voigt<<"\n";
         //std::cout<<"flux of cells, Q _rho\n"<<Q_rho<<"\n";
         //std::cout<<"source of cells, S_rho: "<<S_rho<<"\n";
@@ -615,6 +733,7 @@ void evalWound(
             // Element residuals for rho and c
             Re_rho(nodei) += Jac*(((rho-rho_0)/dt - S_rho)*R[nodei] - Grad_R[nodei].dot(Q_rho))*wip;
             Re_c(nodei) += Jac*(((c-c_0)/dt - S_c)*R[nodei] - Grad_R[nodei].dot(Q_c))*wip;
+            Re_alpha(nodei) += Jac*(((alpha-alpha_0)/dt - S_alpha)*R[nodei] - Grad_R[nodei].dot(Q_alpha))*wip;
             // GGLS stabilization
             //Re_rho(nodei) += Jac*(((Grad_rho-Grad_rho_0)/dt - Grad_S_rho)*tau*(Grad_S_N))*wip;
         }
@@ -660,7 +779,12 @@ void evalWound(
         // then use the derivatives dThetadCC, dThetadrho, dThetadc
         // derivative wrt to CC is done analytically
         //
-        double epsilon = 1e-7;
+        // Step for the central-difference structural sensitivities. Overridable
+        // (WOUND_FDEPS) so the tangent error can be tested for dependence on it:
+        // if the residual Ke_x_x error moves with this, the finite differencing
+        // is the limit; if it sits still, a term is wrong.
+        static const double epsilon = [](){ const char* e = std::getenv("WOUND_FDEPS");
+                                            return e ? std::atof(e) : 1e-7; }();
         //
         // structural parameters
         double phif_plus = phif + epsilon;
@@ -773,7 +897,16 @@ void evalWound(
         // MECHANICS TANGENT
         //
         double Psif11 = 2*k2*kappa*kappa*Psif+2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif1 ;
-        double Psif14 = 2*k2*kappa*(1-3*kappa)*I4e*Psif + 2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif4;
+        // NOTE: no I4e factor here. Psif14 and Psif41 are both d2Psi/dI1e dI4e
+        // and must be equal by symmetry of second derivatives; writing E for
+        // (kappa*I1e + (1-3kappa)*I4e - 1), both evaluate to
+        //     2*k2*kappa*(1-3kappa)*Psif*(1 + 2*k2*E*E).
+        // Psif14 carried a spurious I4e on its first term (about 1.2 in the
+        // healthy state), breaking that symmetry and leaving Ke_x_x
+        // inconsistent with the residual. Caught by tests/test_tangent: the
+        // Ke_x_x error sat flat at 1.3e-2 across an 80-fold sweep of the inner
+        // substep size, so it could not be a discretisation artifact.
+        double Psif14 = 2*k2*kappa*(1-3*kappa)*Psif + 2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif4;
         double Psif41 = 2*k2*(1-3*kappa)*kappa*Psif + 2*k2*(1-3*kappa)*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif1;
         double Psif44 = 2*k2*(1-3*kappa)*(1-3*kappa)*Psif + 2*k2*(1-3*kappa)*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif4;
         std::vector<double> dSSpasdCC_explicit(81,0.);
@@ -849,7 +982,7 @@ void evalWound(
 
                 // structural
                 DDstruct(II,JJ) = dSSdphif(ii,jj)*dphifdCC(kk,ll) + dSSda0x(ii,jj)*da0xdCC(kk,ll)+ dSSda0y(ii,jj)*da0ydCC(kk,ll) + dSSda0z(ii,jj)*da0zdCC(kk,ll)
-                                  +dSSdkappa(ii,jj)*dkappadCC(kk,ll)+dSSdlamdaPa(ii,jj)*dlamdaP_adCC(kk,ll) +dSSdlamdaPs(ii,jj)*dlamdaP_ndCC(kk,ll)+dSSdlamdaPs(ii,jj)*dlamdaP_ndCC(kk,ll);
+                                  +dSSdkappa(ii,jj)*dkappadCC(kk,ll)+dSSdlamdaPa(ii,jj)*dlamdaP_adCC(kk,ll) +dSSdlamdaPs(ii,jj)*dlamdaP_sdCC(kk,ll)+dSSdlamdaPn(ii,jj)*dlamdaP_ndCC(kk,ll);
 
 
                 //--------------------------------------------------//
@@ -975,6 +1108,11 @@ void evalWound(
         Vector3d linQ_rhodrho = -D_rhoc*CCinv*Grad_c;
         Matrix3d linQ_rhodGradc = -D_rhoc*rho*CCinv;
         Matrix3d linQ_cdGradc = -D_cc*CCinv;
+        // alpha: Q_alpha = -D_alpha CCinv Grad_alpha with D_alpha constant, so
+        // the only field linearization is with respect to Grad_alpha.
+        Matrix3d linQ_alphadGradalpha = -D_alpha*CCinv;
+        double   dS_alphadalpha = -d_alpha;
+        double   dS_cdalpha     = p_c_alpha;
         //
         // explicit derivatives of source terms
         double dS_rhodrho_explicit = (p_rho + p_rho_c*c/(K_rho_c+c)+p_rho_theta*He)*(1-rho/K_rho_rho) - d_rho + rho*(p_rho + p_rho_c*c/(K_rho_c+c)+p_rho_theta*He)*(-1./K_rho_rho);
@@ -994,7 +1132,8 @@ void evalWound(
         // SOURCE TERMS
         Matrix3d dHedCC_explicit; dHedCC_explicit.setZero();
         //
-        dHedCC_explicit = -1./pow((1.+exp(-gamma_theta*(Je - vartheta_e))),2)*(exp(-gamma_theta*(Je - vartheta_e)))*(-gamma_theta)*(J*CCinv/(2*Jp));
+        // dH/dCC = gamma_e H (1-H) dtheta_e/dCC  (was dJe/dCC = J CCinv/(2 Jp))
+        dHedCC_explicit = evalDHedCC(theta_e, He, gamma_theta, CCinv, n0);
         Matrix3d dS_rhodCC_explicit = (1-rho/K_rho_rho)*rho*p_rho_theta*dHedCC_explicit;
         VectorXd dS_rhodCC_voigt(6);
         Matrix3d dS_cdCC_explicit = (rho / (K_c_c + c)) * (p_c_thetaE * dHedCC_explicit);
@@ -1002,6 +1141,7 @@ void evalWound(
         // FLUX TERMS
         std::vector<double> dQ_rhodCC_explicit(27,0.);
         std::vector<double> dQ_cdCC_explicit(27,0.);
+        std::vector<double> dQ_alphadCC_explicit(27,0.);
         for(int ii=0;ii<3;ii++) {
             for(int jj=0;jj<3;jj++) {
                 for(int kk=0;kk<3;kk++) {
@@ -1014,7 +1154,21 @@ void evalWound(
                         //dQ_rhodCC_explicit[ii*9+kk*3+ll] += -1.0*(-3*(D_rhorho-phif*(D_rhorho-D_rhorho/10))*A0(ii,jj)*Grad_rho(jj)
                         //        - 3*(D_rhoc-phif*(D_rhoc-D_rhoc/10))*rho*A0(ii,jj)*Grad_c(jj))*dtrAdCC(kk,ll) / (trA*trA);
 
-                        dQ_cdCC_explicit[ii*9+kk*3+ll] += -0.5*(-1.0*(D_cc-phif*(D_cc-D_cc/10)))*(CCinv(ii,kk)*CCinv(jj,ll)+CCinv(jj,kk)*CCinv(ii,ll))*Grad_c(jj);
+                        // D_cc, NOT the collagen-dependent (D_cc - phif*(D_cc - D_cc/10)).
+                        // The residual uses a constant cytokine diffusivity -
+                        //     Q_c = -D_cc*CCinv*Grad_c
+                        // - and the collagen-dependent form sits commented out
+                        // directly beneath it. The tangent was never updated to
+                        // match, so at healthy collagen (phif = 1) it used
+                        // D_cc/10: ten times too small. Measured by
+                        // tests/test_tangent as Ke_c_x carrying an error an
+                        // order of magnitude LARGER than the block itself,
+                        // because the flux contribution was almost entirely
+                        // absent while the source contribution was correct.
+                        dQ_cdCC_explicit[ii*9+kk*3+ll] += -0.5*(-1.0*D_cc)*(CCinv(ii,kk)*CCinv(jj,ll)+CCinv(jj,kk)*CCinv(ii,ll))*Grad_c(jj);
+
+                        // alpha: Q_alpha = -D_alpha CCinv Grad_alpha, same form
+                        dQ_alphadCC_explicit[ii*9+kk*3+ll] += -0.5*(-1.0*D_alpha)*(CCinv(ii,kk)*CCinv(jj,ll)+CCinv(jj,kk)*CCinv(ii,ll))*Grad_alpha(jj);
 
                         //dQ_cdCC_explicit[ii*9+kk*3+ll] += -1.0*(-3*(D_cc-phif*(D_cc-D_cc/10))*A0(ii,jj)*Grad_c(jj))
                         //       *dtrAdCC(kk,ll)/(trA*trA);
@@ -1029,6 +1183,7 @@ void evalWound(
         MatrixXd dQ_rhodCC_explicit_voigt(3,6); dQ_rhodCC_explicit_voigt.setZero();
         MatrixXd dQ_rhodCC_structural_voigt(3,6); dQ_rhodCC_structural_voigt.setZero();
         MatrixXd dQ_cdCC_voigt(3,6); dQ_cdCC_voigt.setZero();
+        MatrixXd dQ_alphadCC_voigt(3,6); dQ_alphadCC_voigt.setZero();
         MatrixXd dQ_cdCC_explicit_voigt(3,6); dQ_cdCC_explicit_voigt.setZero();
         MatrixXd dQ_cdCC_structural_voigt(3,6); dQ_cdCC_structural_voigt.setZero();
         VectorXd dS_rhodCC_explicit_voigt(6); dS_rhodCC_explicit_voigt.setZero();
@@ -1070,6 +1225,9 @@ void evalWound(
                           + dQ_cdlamdaPs(ii)*dlamdaP_sdCC(kk,ll) + dQ_cdlamdaPn(ii)*dlamdaP_ndCC(kk,ll);
 
                 dQ_cdCC_voigt(II,JJ) = dQ_cdCC_explicit_voigt(II,JJ) + dQ_cdCC_structural_voigt(II,JJ);
+                // alpha has no phif/a0/kappa/lamdaP dependence, so there is no
+                // structural contribution here - only the explicit CC one.
+                dQ_alphadCC_voigt(II,JJ) = dQ_alphadCC_explicit[ii*9+kk*3+ll];
 
                 dS_rhodCC_explicit_voigt(JJ) = dS_rhodCC_explicit(kk,ll);
 
@@ -1141,31 +1299,65 @@ void evalWound(
 
                     Ke_c_x(nodei,nodej*3+coordj) += -(R[nodei]*dS_cdCC_voigt.dot(linCC_voigt) + Grad_R[nodei].dot(dQ_cdCC_voigt*linCC_voigt))*Jac*wip;
 
+                    // Ke_alpha_x: only the flux couples to the deformation,
+                    // because s_alpha = -d_alpha alpha has no CC dependence.
+                    Ke_alpha_x(nodei,nodej*3+coordj) += -(Grad_R[nodei].dot(dQ_alphadCC_voigt*linCC_voigt))*Jac*wip;
+
                 }
 
                 //-----------//
                 // Ke_rho_rho
                 //-----------//
 
-                Ke_rho_rho(nodei,nodej) += Jac*(R[nodei]*R[nodej]/dt -1.* R[nodei]*dS_rhodrho*R[nodej] -1.* Grad_R[nodei].dot(linQ_rhodGradrho*Grad_R[nodej] + linQ_rhodrho*R[nodej]))*wip;
+                // The flux terms carry a chain rule through the structural
+                // update that used to be dropped: D_rho depends on phif, and
+                // phif depends on rho and c via the local solver, so
+                //   dQ_rho/drho_j += (dQ_rho/dphif)(dphif/drho) R_j
+                // The source terms were already fully chain-ruled (see
+                // dS_rhodrho above); the fluxes were chain-ruled only through
+                // CC, i.e. D was frozen with respect to rho and c. That was
+                // survivable with a mild D(phi) but not with the tanh gate in
+                // evalDrho(), whose slope reaches ~150 at phi = 0.01.
+                Ke_rho_rho(nodei,nodej) += Jac*(R[nodei]*R[nodej]/dt -1.* R[nodei]*dS_rhodrho*R[nodej] -1.* Grad_R[nodei].dot(linQ_rhodGradrho*Grad_R[nodej] + linQ_rhodrho*R[nodej] + dQ_rhodphif*dphifdrho*R[nodej]))*wip;
 
                 //-----------//
                 // Ke_rho_c
                 //-----------//
 
-                Ke_rho_c(nodei,nodej) += Jac*(-1.*R[nodei]*dS_rhodc*R[nodej] -1.* Grad_R[nodei].dot(linQ_rhodGradc*Grad_R[nodej]))*wip;
+                Ke_rho_c(nodei,nodej) += Jac*(-1.*R[nodei]*dS_rhodc*R[nodej] -1.* Grad_R[nodei].dot(linQ_rhodGradc*Grad_R[nodej] + dQ_rhodphif*dphifdc*R[nodej]))*wip;
 
                 //-----------//
                 // Ke_c_rho
                 //-----------//
-
-                Ke_c_rho(nodei,nodej) += Jac*(-1.*R[nodei]*dS_cdrho*R[nodej])*wip;
+                // dQ_cdphif is identically zero while D_cc is constant, but
+                // keep the term so the tangent stays consistent if D_c ever
+                // becomes collagen-dependent.
+                Ke_c_rho(nodei,nodej) += Jac*(-1.*R[nodei]*dS_cdrho*R[nodej] -1.* Grad_R[nodei].dot(dQ_cdphif*dphifdrho*R[nodej]))*wip;
 
                 //-----------//
                 // Ke_c_c
                 //-----------//
 
-                Ke_c_c(nodei,nodej) += Jac*(R[nodei]*R[nodej]/dt -1.* R[nodei]*dS_cdc*R[nodej] -1.* Grad_R[nodei].dot(linQ_cdGradc*Grad_R[nodej]))*wip;
+                Ke_c_c(nodei,nodej) += Jac*(R[nodei]*R[nodej]/dt -1.* R[nodei]*dS_cdc*R[nodej] -1.* Grad_R[nodei].dot(linQ_cdGradc*Grad_R[nodej] + dQ_cdphif*dphifdc*R[nodej]))*wip;
+
+                //-----------//
+                // Ke_c_alpha : cytokine production driven by alpha
+                //-----------//
+
+                Ke_c_alpha(nodei,nodej) += Jac*(-1.*R[nodei]*dS_cdalpha*R[nodej])*wip;
+
+                //-----------//
+                // Ke_alpha_alpha
+                //-----------//
+
+                Ke_alpha_alpha(nodei,nodej) += Jac*(R[nodei]*R[nodej]/dt -1.*R[nodei]*dS_alphadalpha*R[nodej] -1.*Grad_R[nodei].dot(linQ_alphadGradalpha*Grad_R[nodej]))*wip;
+
+                //-----------//
+                // Ke_alpha_rho, Ke_alpha_c : alpha has no rho or c dependence
+                // (s_alpha = -d_alpha alpha, Q_alpha = -D_alpha grad alpha), so
+                // these blocks stay zero. Ke_x_alpha and Ke_rho_alpha likewise:
+                // alpha enters neither the stress nor the fibroblast source.
+                //-----------//
             }
         }
     } // END INTEGRATION loop
@@ -1189,15 +1381,7 @@ void evalFluxesSources(const std::vector<double> &global_parameters, const doubl
     double t_rho_c = global_parameters[4]; // force of myofibroblasts enhanced by chemical
     double K_t = global_parameters[5]; // saturation of collagen on force
     double K_t_c = global_parameters[6]; // saturation of chemical on force
-    double eq_const = 1582.3;
-    double eq_a = 182.01;
-    double eq_b = -655;
-    double eq_c = 875.66;
-    double eq_d = -521.57;
-    double eq_e = 118.9;
-    double phif00 = 1e-2;
-    double D_rhorho = eq_const*((pow((((eq_a*pow(phif-phif00,5)) + (eq_b*pow(phif-phif00,4)) + (eq_c*pow(phif-phif00,3)) + (eq_d*pow(phif-phif00,2)) + (eq_e*(phif-phif00)))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1)))));
-    // double D_rhorho = eq_const*((pow((((eq_a*pow(phif,5)) + (eq_b*pow(phif,4)) + (eq_c*pow(phif,3)) + (eq_d*pow(phif,2)) + (eq_e*phif))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1))))) + 6.12E-5 + (0.00612*(c/(1E-5+c)));
+    double D_rhorho = evalDrho(phif, c);
     double D_rhoc = global_parameters[8]; // diffusion of chemotactic gradient
     double D_cc = global_parameters[9]; // diffusion of chemical
     double p_rho =global_parameters[10]; // production of fibroblasts naturally
@@ -1285,11 +1469,19 @@ void evalFluxesSources(const std::vector<double> &global_parameters, const doubl
     //------------------//
     // Second Piola Kirchhoff stress tensor
     // passive elastic
-    double Psif = (kf/(2.*k2))*(exp( k2*pow((kappa*I1e + (1-3*kappa)*I4e -1),2))-1);
+    // NOTE: no "-1" here. Psif is not the strain energy itself but the factor
+    // (kf/2k2) exp(k2 E^2) whose product with 2 k2 kappa E reproduces
+    // dPsi/dI1e = kf kappa E exp(k2 E^2) in Psif1/Psif4 below. Subtracting 1
+    // (as this line used to) makes those derivatives inconsistent with the
+    // analytic stress in evalWound, which corrupts every finite-difference
+    // structural sensitivity computed from this routine and degrades the
+    // Newton convergence rate.
+    double Psif = (kf/(2.*k2))*(exp( k2*pow((kappa*I1e + (1-3*kappa)*I4e -1),2)));
     double Psif1 = 2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
     double Psif4 = 2*k2*(1-3*kappa)*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
     //Matrix3d SSe_pas = k0*Identity + phif*(Psif1*Identity + Psif4*a0a0);
-    Matrix3d SSe_pas = phif*(k0*Matrix3d::Identity() + Psif1*Matrix3d::Identity() + Psif4*a0a0);
+    Matrix3d SSe_pas = phifMech(phif)*k0*Matrix3d::Identity()
+                     + phif*(Psif1*Matrix3d::Identity() + Psif4*a0a0);
     // pull back to the reference,
     Matrix3d SS_pas = Jp*FFginv*SSe_pas*FFginv;
     //------------------//
@@ -1304,7 +1496,7 @@ void evalFluxesSources(const std::vector<double> &global_parameters, const doubl
     // Instead of (double pressure = -k0*lamda_N*lamda_N;) directly, add volumetric part of stress SSvol
     double penalty = 0.3166667;
     double Psivol = 0.5*phif*pow(penalty*(Je-1.),2) - 2*phif*k0*log(Je);
-    double dPsivoldJe = phif*penalty*(Je-1.) - 2*phif*k0/Je;
+    double dPsivoldJe = volPenaltyScale(phif)*penalty*(Je-1.) - 2*phifMech(phif)*k0/Je;
     Matrix3d SSe_vol = dPsivoldJe*Je*CCeinv/2;
     Matrix3d SS_vol = Jp*FFginv*SSe_vol*FFginv;
     //------------------//
@@ -1330,7 +1522,12 @@ void evalFluxesSources(const std::vector<double> &global_parameters, const doubl
     //------------------//
     // SOURCE
     //------------------//
-    double He = 1./(1.+exp(-gamma_theta*(Je - vartheta_e)));
+    // Mechanosensing stimulus: in-plane AREAL elastic stretch of the dural
+    // mid-surface, theta_e = ||cof(F^e).n0||, NOT det(F^e). The tissue is
+    // treated as incompressible so det(F^e)==1 and could never respond to
+    // membrane stretch. See include/mechanosensing.h.
+    double theta_e = evalThetaE(J, CCinv, n0, lamdaP(0), lamdaP(1));
+    double He = evalHe(theta_e, vartheta_e, gamma_theta);
 
     // function for elastic response of the cells
     S_rho = (p_rho + p_rho_c*c/(K_rho_c+c)+p_rho_theta*He)*(1-rho/K_rho_rho)*rho - d_rho*rho;
@@ -1552,8 +1749,11 @@ void evalSS(const std::vector<double> &global_parameters, double phif, Vector3d 
     // Instead of (double pressure = -k0*lamda_N*lamda_N;) directly, add volumetric part of stress SSvol
     double penalty = 0.3166667;
     double Psivol = 0.5*phif*pow(penalty*(Je-1.),2) - 2*phif*k0*log(Je);
-    double dPsivoldJe = phif*penalty*(Je-1.) - 2*phif*k0/Je;
-    double dPsivoldJedJe = phif*penalty + 2*k0/(Je*Je);
+    // NOTE: evalSS is dead (only referenced from commented-out FD blocks). Kept
+    // consistent with evalWound anyway. The k0 term here was missing its phif,
+    // unlike every other site - fixed, so reviving this does not reintroduce it.
+    double dPsivoldJe = volPenaltyScale(phif)*penalty*(Je-1.) - 2*phifMech(phif)*k0/Je;
+    double dPsivoldJedJe = volPenaltyScale(phif)*penalty + 2*phifMech(phif)*k0/(Je*Je);
     Matrix3d SSe_vol = dPsivoldJe*Je*CCeinv/2;
     SS_vol = Jp*FFginv*SSe_vol*FFginv;
 }
@@ -1580,15 +1780,7 @@ void evalQ(const std::vector<double> &global_parameters, const double& phif,Vect
     // calculate the structure tensor
     Matrix3d A0 = kappa*Identity + (1-3.*kappa)*a0a0;
     double trA = kappa*(CC(0,0)+CC(1,1)+CC(2,2)) + (1-3*kappa)*I4tot;
-    double eq_const = 1582.3;
-    double eq_a = 182.01;
-    double eq_b = -655;
-    double eq_c = 875.66;
-    double eq_d = -521.57;
-    double eq_e = 118.9;
-    double phif00 = 1e-2;
-    double D_rhorho = eq_const*((pow((((eq_a*pow(phif-phif00,5)) + (eq_b*pow(phif-phif00,4)) + (eq_c*pow(phif-phif00,3)) + (eq_d*pow(phif-phif00,2)) + (eq_e*(phif-phif00)))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1)))));
-    // double D_rhorho = eq_const*((pow((((eq_a*pow(phif,5)) + (eq_b*pow(phif,4)) + (eq_c*pow(phif,3)) + (eq_d*pow(phif,2)) + (eq_e*phif))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1))))) + 6.12E-5 + (0.00612*(c/(1E-5+c)));
+    double D_rhorho = evalDrho(phif, c);
     // Flux and Source terms for the rho and the C
     Q_rho = -D_rhorho*CCinv*Grad_rho - D_rhoc*CCinv*Grad_c;
     //Q_rho = -3*(D_rhorho-phif*(D_rhorho-D_rhorho/10))*A0*Grad_rho/trA - 3*(D_rhoc-phif*(D_rhoc-D_rhoc/10))*rho*A0*Grad_c/trA;
@@ -1629,8 +1821,14 @@ void evalS(const std::vector<double> &global_parameters, const double& phif,Vect
     Matrix3d FFginv = (1./lamdaP_a)*(a0a0) + (1./lamdaP_s)*(s0s0) + (1./lamdaP_n)*n0n0;
     Matrix3d CCe = FFginv*CC*FFginv;
     double Je = sqrt(CCe.determinant());
+    double J = Je*Jp;
     // Flux and Source terms for the rho and the C
-    double He = 1./(1.+exp(-gamma_theta*(Je - vartheta_e)));
+    // Mechanosensing stimulus: in-plane AREAL elastic stretch of the dural
+    // mid-surface, theta_e = ||cof(F^e).n0||, NOT det(F^e). The tissue is
+    // treated as incompressible so det(F^e)==1 and could never respond to
+    // membrane stretch. See include/mechanosensing.h.
+    double theta_e = evalThetaE(J, CCinv, n0, lamdaP_a, lamdaP_s);
+    double He = evalHe(theta_e, vartheta_e, gamma_theta);
     // function for elastic response of the cells
     S_rho = (p_rho + p_rho_c*c/(K_rho_c+c)+p_rho_theta*He)*(1-rho/K_rho_rho)*rho - d_rho*rho;
     // function for elastic response of the chemical
@@ -2215,15 +2413,7 @@ void evalBC(int surface_boundary_flag, const std::vector<double> &ip_Jac, const 
 
         Vector3d traction = Vector3d(0,0,0);
         double spring = -1e-4;
-	double eq_const = 1582.3;
-	double eq_a = 182.01;
-	double eq_b = -655;
-	double eq_c = 875.66;
-	double eq_d = -521.57;
-	double eq_e = 118.9;
-    double phif00 = 1e-2;
-    double D_rhorho = eq_const*((pow((((eq_a*pow(phif-phif00,5)) + (eq_b*pow(phif-phif00,4)) + (eq_c*pow(phif-phif00,3)) + (eq_d*pow(phif-phif00,2)) + (eq_e*(phif-phif00)))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1)))));
-	// double D_rhorho = eq_const*((pow((((eq_a*pow(phif,5)) + (eq_b*pow(phif,4)) + (eq_c*pow(phif,3)) + (eq_d*pow(phif,2)) + (eq_e*phif))*0.001),2))/6)*(1-(1/(1+exp(-500*(phif-1))))) + 6.12E-5 + (0.00612*(c/(1E-5+c)));
+    double D_rhorho = evalDrho(phif, c);
         double k_rho_0 = -D_rhorho/10;
         double k_rho = (k_rho_0-phif*(k_rho_0-k_rho_0/10)); // -3.0*(D_rhorho-phif*(D_rhorho-D_rhorho/10))*A0*Grad_rho/trA - 3*(D_rhoc-phif*(D_rhoc-D_rhoc/10))*rho*A0*Grad_c/trA;
         double d_k_rho_dphif = (k_rho_0-k_rho_0/10);
@@ -2576,7 +2766,10 @@ void evalWoundMechanics(double dt, double time, double time_final,
         double Psif1 = 2*k2*kappa*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
         double Psif4 = 2*k2*(1-3*kappa)*(kappa*I1e + (1-3*kappa)*I4e -1)*Psif;
         //Matrix3d SSe_pas = k0*Identity + phif*(Psif1*Identity + Psif4*a0a0);
-        Matrix3d SSe_pas = phif*(k0*Identity + Psif1*Identity + Psif4*a0a0);
+        // Ground substance uses the FLOORED collagen fraction (phifMech, a no-op
+        // unless WOUND_PHIFLOOR is set); fibres keep the true phif.
+        Matrix3d SSe_pas = phifMech(phif)*k0*Identity
+                         + phif*(Psif1*Identity + Psif4*a0a0);
         // pull back to the reference,
         Matrix3d SS_pas = Jp*FFginv*SSe_pas*FFginv;
 
@@ -2596,8 +2789,8 @@ void evalWoundMechanics(double dt, double time, double time_final,
         // SSvol = 2dPsivol/dCC = 2dPsivol/dJe * dJe/dCC
         double penalty = 0.3166667;
         double Psivol = 0.5*phif*pow(penalty*(Je-1.),2) - 2*phif*k0*log(Je); //*phif
-        double dPsivoldJe = phif*penalty*(Je-1.) - 2*phif*k0/Je;
-        double dPsivoldJedJe = phif*penalty + 2*phif*k0/(Je*Je);
+        double dPsivoldJe = volPenaltyScale(phif)*penalty*(Je-1.) - 2*phifMech(phif)*k0/Je;
+        double dPsivoldJedJe = volPenaltyScale(phif)*penalty + 2*phifMech(phif)*k0/(Je*Je);
         Matrix3d SSe_vol = dPsivoldJe*Je*CCeinv/2; // = phif*penalty*Je*(Je-1.)*CCeinv/2 - phif*k0*CCeinv;
         Matrix3d SS_vol = Jp*FFginv*SSe_vol*FFginv;
 

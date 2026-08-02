@@ -21,6 +21,15 @@ using namespace Eigen;
 //========================================================//
 // LOCAL PROBLEM: structural update
 //
+// Non-smooth branch instrumentation. Newton limit-cycles inside failing steps
+// (residual alternating bit-for-bit between two values for 200 iterations), which
+// is a slope discontinuity in the residual. These count how many integration
+// points sit in each non-smooth branch of the local solver and how close they are
+// to flipping, so the responsible branch identifies itself instead of being
+// guessed at. Call reset before assembling a Newton iteration and report after.
+void resetBranchStats();
+void reportBranchStats(const char *tag);
+
 void localWoundProblemExplicit(
         double dt, const std::vector<double> &local_parameters,const Vector3d &X,
         double C,double rho,const Matrix3d &FF,
